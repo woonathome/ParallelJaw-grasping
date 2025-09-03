@@ -465,14 +465,20 @@ def check_gripper_feasibility(
     use_mesh: str = "mesh_quad"    # 충돌검사에 사용할 메쉬 키: "mesh_quad" 권장
 ):
     """
-    result['top_k']의 각 pair에 대해 양쪽 패드+접근여유 OBB와 메쉬 충돌 검사.
-    - 충돌 없음: feasible=True
-    - 충돌 있으면: False (어느 쪽이 걸렸는지 사유 포함)
+    result['top_k']의 각 pair에 대해 pad approach OBB와 메쉬 충돌 검사.
+    충돌 없음: feasible=True
     반환: [{pair_index, patch_i, patch_j, feasible}] 리스트
     """
     mesh = result[use_mesh]
     patches = {p["id"]: p for p in result["patches"]}
     cands = result.get("top_k", [])
+
+    # COM (fallback: bbox center)
+    try:
+        com = mesh.center_mass
+    except Exception:
+        bmin, bmax = mesh.bounds
+        com = 0.5 * (bmin + bmax)
 
     # 충돌 매니저 준비(메쉬 1회 등록)
     cm = CollisionManager()
@@ -483,25 +489,46 @@ def check_gripper_feasibility(
         pid_i, pid_j = cand["patch_i"], cand["patch_j"]
         if pid_i not in patches or pid_j not in patches:
             reports.append(dict(pair_index=k, patch_i=pid_i, patch_j=pid_j,
-                                feasible=False, reason="patch id not found"))
+                                feasible=False))
             continue
         p_i, p_j = patches[pid_i], patches[pid_j]
 
+        # --- 1) pad OBB 생성 & 충돌 검사 ---
         # 양쪽 패드 OBB 생성
         box_i = make_pad_box_at_patch(p_i, pad_w, pad_h, pad_d, clearance_out)
         box_j = make_pad_box_at_patch(p_j, pad_w, pad_h, pad_d, clearance_out)
-
         # 충돌 검사 (각각 독립적으로 검사)
         collide_i = cm.in_collision_single(box_i)
         collide_j = cm.in_collision_single(box_j)
-
         feasible = (not collide_i) and (not collide_j)
 
-        reports.append(dict(
-            pair_index=k,
-            patch_i=pid_i,
-            patch_j=pid_j,
-            feasible=feasible
-        ))
+        # if not feasible:
+        #     continue
 
-    return reports
+        # --- 2) 모멘트 계산 (COM 기준) ---
+        ci = np.asarray(p_i["centroid"], float)
+        cj = np.asarray(p_j["centroid"], float)
+
+        # 그리퍼 수축 방향(p_i, p_j의 바깥 방향 normal의 반대)
+        Fi = unit(-np.asarray(p_i["normal"]))    # 1N 가정
+        Fj = unit(-np.asarray(p_j["normal"]))
+
+        ri = ci - com
+        rj = cj - com
+        tau = np.cross(ri, Fi) + np.cross(rj, Fj)
+        moment = float(np.linalg.norm(tau))
+
+        report = dict(
+            pair_index=k,
+            patch_i=pid_i, patch_j=pid_j,
+            feasible=feasible,
+            moment=moment
+        )
+        reports.append(report)
+        
+    report_sorted = sorted( # Feasible, moment 정렬
+        reports,
+        key=lambda r: (not r.get("feasible", False), r.get("moment", float("inf")))
+    )
+
+    return report_sorted
