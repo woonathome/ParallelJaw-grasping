@@ -1,7 +1,7 @@
 # Parallel Gripper Grasping (Planar Patches)
 
 2-finger parallel gripper용 **그리핑 후보 패치 쌍**을 CAD mesh에서 자동으로 찾아내는 알고리즘  
-임의의 CAD 모델에서 평면 패치를 추출하고, 법선을 정렬한 뒤, **서로 마주보는 패치 쌍**을 점수화하여 파지 가능성을 평가합니다.
+임의의 CAD 모델에서 평면 패치를 추출하고, **서로 마주보는 패치 쌍**을 점수화하여 파지 가능성을 평가
 
 ---
 
