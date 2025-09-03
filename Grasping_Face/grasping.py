@@ -1,4 +1,4 @@
-# Compute Patch Pairs
+# Compute Patch Pairs, Feasible Grasping Pairs
 
 import json, math
 from dataclasses import dataclass, asdict
@@ -23,8 +23,9 @@ class PatchPairParams:
     min_opening: float = 5.0
     max_opening: float = 140.0
     angle_tolerance_deg: float = 15.0
-    parallel_weight: float = 0.3 # TODO: 추후 다른 기준 추가 시 조정
-    overlap_weight:  float = 0.7 # TODO: 추후 다른 기준 추가 시 조정
+    # parallel_weight: float = 0.2 # TODO: 추후 다른 기준 추가 시 조정
+    overlap_weight:  float = 0.5 # TODO: 추후 다른 기준 추가 시 조정
+    distance_weight:  float = 0.5 # TODO: 추후 다른 기준 추가 시 조정
     samples_per_face= 3          # face 샘플링 개수
 
 
@@ -103,6 +104,16 @@ def plane_from_points(points: np.ndarray) -> Tuple[np.ndarray, float]:
 
 def point_plane_distance_signed(p: np.ndarray, n: np.ndarray, b: float) -> float:
     return float(n @ p - b)
+
+def point_line_distance(c_a:np.ndarray, n_a:np.ndarray, c_b:np.ndarray):
+    """
+    c_a 시작점, n_a 방향, c_b 거리측정 목표지점
+    """
+    n_u = unit(n_a)
+    r = c_b - c_a
+    t = float(np.dot(r, n_u)) # 직선 파라미터
+    dist = float(np.linalg.norm(r - t * n_u))
+    return dist
 
 def triangular_membership(x, a, b):
     if x <= a or x >= b:
@@ -340,16 +351,16 @@ def score_patch_pair(patch_a: PlanarPatch,
     n_a = unit(np.array(patch_a.normal))
     n_b = unit(np.array(patch_b.normal))
 
-    # 평행/반대 점수: normal 각도
-    dot_ab = float(n_a @ n_b)
-    s_parallel = max(0.0, -dot_ab)
-    ang = math.degrees(math.acos(max(-1.0, min(1.0, dot_ab))))
-    if ang < (180.0 - params.angle_tolerance_deg):
-        s_parallel *= (ang / (180.0 - params.angle_tolerance_deg))
-    if dot_ab > 0.0:
-        s_parallel = 0.0
+    # # 평행/반대 점수: normal 각도
+    # dot_ab = float(n_a @ n_b)
+    # s_parallel = max(0.0, -dot_ab)
+    # ang = math.degrees(math.acos(max(-1.0, min(1.0, dot_ab))))
+    # if ang < (180.0 - params.angle_tolerance_deg):
+    #     s_parallel *= (ang / (180.0 - params.angle_tolerance_deg))
+    # if dot_ab > 0.0:
+    #     s_parallel = 0.0
 
-    # 투영-포함 점수: i-j 상호 투영 비율의 곱
+    # 투영-포함 점수: i-j 상호 투영 비율의 곱 (패치 2개의 평행성 검사 1)
     overlap_a = projection_overlap_ratio(mesh_for_overlap,
                                            asdict(patch_a) if hasattr(patch_a, "id") else patch_a,
                                            asdict(patch_b) if hasattr(patch_b, "id") else patch_b,
@@ -365,8 +376,14 @@ def score_patch_pair(patch_a: PlanarPatch,
     c_b = np.asarray(patch_b.centroid)
     width = np.linalg.norm(c_a - c_b)
 
+    # TODO: c-n 최소 거리 점수: c-n 직선과 c간의 거리 점수(패치 2개의 평행성 검사 2)
+    bbox_diag = float(np.linalg.norm(mesh_for_overlap.bounds[1] - mesh_for_overlap.bounds[0]))
+    dist_a = point_line_distance(c_a, n_a, c_b)
+    dist_b = point_line_distance(c_b, n_b, c_a)
+    s_distance = 1 - (dist_a + dist_b) / bbox_diag
+
     # 최종 점수(가중합)
-    score = params.parallel_weight * s_parallel + params.overlap_weight * s_overlap
+    score = params.overlap_weight * s_overlap + params.distance_weight * s_distance
 
     return PatchPairCandidate(
         patch_i=patch_a.id,
@@ -374,7 +391,7 @@ def score_patch_pair(patch_a: PlanarPatch,
         normal=n_a.tolist(),
         width=width,
         score=score,
-        terms={"parallel": s_parallel, "overlap": s_overlap},
+        terms={"overlap": s_overlap, "distance": s_distance},
     )
 
 
@@ -525,7 +542,7 @@ def check_gripper_feasibility(
             moment=moment
         )
         reports.append(report)
-        
+
     report_sorted = sorted( # Feasible, moment 정렬
         reports,
         key=lambda r: (not r.get("feasible", False), r.get("moment", float("inf")))
