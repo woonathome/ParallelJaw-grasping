@@ -24,8 +24,8 @@ class PatchPairParams:
     max_opening: float = 140.0
     angle_tolerance_deg: float = 15.0
     # parallel_weight: float = 0.2 # TODO: 추후 다른 기준 추가 시 조정
-    overlap_weight:  float = 0.5 # TODO: 추후 다른 기준 추가 시 조정
-    distance_weight:  float = 0.5 # TODO: 추후 다른 기준 추가 시 조정
+    # overlap_weight:   float = 0.3 # TODO: 추후 다른 기준 추가 시 조정
+    distance_weight:  float = 1.0 # TODO: 추후 다른 기준 추가 시 조정
     samples_per_face= 3          # face 샘플링 개수
 
 
@@ -41,9 +41,9 @@ class PatchPairCandidate:
 
 @dataclass
 class PadParams:
-    pad_w: float = 15.0
-    pad_h: float = 20.0
-    pad_d: float = 5.0
+    pad_w: float = 34.0 # 34
+    pad_h: float = 21.0 # 21
+    pad_d: float = 7.0 # 7
 
 
 # --------------------------
@@ -102,9 +102,6 @@ def plane_from_points(points: np.ndarray) -> Tuple[np.ndarray, float]:
     b = float(n @ centroid)
     return n, b
 
-def point_plane_distance_signed(p: np.ndarray, n: np.ndarray, b: float) -> float:
-    return float(n @ p - b)
-
 def point_line_distance(c_a:np.ndarray, n_a:np.ndarray, c_b:np.ndarray):
     """
     c_a 시작점, n_a 방향, c_b 거리측정 목표지점
@@ -114,15 +111,6 @@ def point_line_distance(c_a:np.ndarray, n_a:np.ndarray, c_b:np.ndarray):
     t = float(np.dot(r, n_u)) # 직선 파라미터
     dist = float(np.linalg.norm(r - t * n_u))
     return dist
-
-def triangular_membership(x, a, b):
-    if x <= a or x >= b:
-        return 0.0
-    mid = 0.5 * (a + b)
-    if x <= mid:
-        return (x - a) / (mid - a)
-    else:
-        return (b - x) / (b - mid)
 
 def basis_from_normal(n: np.ndarray):
     n = unit(n)
@@ -143,6 +131,15 @@ def point_in_tri_2d(p, a, b, c): # 삼각형 내부 검사
     w = (d00 * d21 - d01 * d20) / denom
     u = 1.0 - v - w
     return (u >= 0) and (v >= 0) and (w >= 0)
+
+def rotate_byaxis(axis, ang_deg):
+    axis = unit(axis)
+    th = np.deg2rad(ang_deg)
+    K = np.array([[0, -axis[2], axis[1]],
+                  [axis[2], 0, -axis[0]],
+                  [-axis[1], axis[0], 0]], float)
+    I = np.eye(3)
+    return I + np.sin(th)*K + (1-np.cos(th))*(K@K)
 
 def sample_points_on_patch(mesh: trimesh.Trimesh, face_idx, samples_per_face):
     faces = mesh.faces[np.asarray(list(face_idx), dtype=int)]
@@ -207,7 +204,8 @@ def projection_overlap_ratio(mesh: trimesh.Trimesh,
     inside = int(hit.sum())
     return (inside / valid) if valid > 0 else 0.0
 
-def make_pad_box_at_patch(patch, pad_w, pad_h, pad_d, clearance_out, lift_mm: float = 2.0):
+def make_pad_box_at_patch(patch, pad_w, pad_h, pad_d, clearance_out,
+                          lift_mm: float = 2.0):
     """
     패치 평면의 바깥쪽(+n)으로 'pad_d + clearance_out' 만큼 돌출된 OBB 생성
     + centroid에서 바깥쪽으로 lift_mm 만큼 추가 이격하여 검사 (normal이 정확히 표면에 있지 않음)
@@ -220,14 +218,44 @@ def make_pad_box_at_patch(patch, pad_w, pad_h, pad_d, clearance_out, lift_mm: fl
     c = np.asarray(patch["centroid"], float)
 
     ext_z = float(pad_d + clearance_out)
-    box = trimesh.creation.box(extents=[float(pad_w), float(pad_h), ext_z])
+    box = trimesh.creation.box(extents=[float(pad_w) / 2, float(pad_h) / 2, ext_z])
 
     T = np.eye(4)
     T[:3, :3] = np.column_stack([u, v, n])
-    T[:3,  3] = c + n * (lift_mm + ext_z * 0.5)
+    T[:3,  3] = c + n * (lift_mm + 0.5*ext_z)
+    # T[:3,  3] = c + n*0.5*ext_z
+    # + n * lift_mm
     box.apply_transform(T)
     return box
 
+def make_rot_pad_box_at_patch(patch, pad_w, pad_h, pad_d, clearance_out,
+                              lift_mm: float = 2.0, yaw_deg: float = 0.0):
+    """
+    패치 평면의 바깥쪽(+n)으로 'pad_d + clearance_out' 만큼 돌출된 OBB 생성
+    - extents = [pad_w, pad_h, pad_d + clearance_out]
+    - 로컬 축: [u, v, n] (n=바깥쪽). yaw는 로컬 n축 기준 회전만 적용
+    - center = c + n_world * (lift_mm + 0.5*ext_z)
+    """
+    n = unit(np.asarray(patch["normal"], float))
+    u, v, n = basis_from_normal(n)  # right-handed
+    c = np.asarray(patch["centroid"], float)
+
+    ext_z = float(pad_d + clearance_out)
+    box = trimesh.creation.box(extents=[float(pad_w) / 2, float(pad_h) / 2, ext_z])
+
+    # 로컬 yaw 회전: R_world = B @ Rz(yaw)
+    B = np.column_stack([u, v, n])
+    cy, sy = np.cos(np.deg2rad(yaw_deg)), np.sin(np.deg2rad(yaw_deg))
+    Rz = np.array([[cy, -sy, 0.0],
+                   [sy,  cy, 0.0],
+                   [0.0, 0.0, 1.0]], float)
+    R_world = B @ Rz
+    n_world = R_world[:, 2]
+    T = np.eye(4)
+    T[:3, :3] = R_world
+    T[:3,  3] = c + n_world * (lift_mm + 0.5*ext_z)
+    box.apply_transform(T)
+    return box
 
 # --------------------------
 # Planar patch extraction
@@ -255,7 +283,7 @@ def extract_planar_patches(
 
     tri_verts = mesh.vertices[faces]
     tri_areas = trimesh.triangles.area(tri_verts)
-    tri_centroids = (tri_verts.max(axis=1) + tri_verts.min(axis=1)) / 2
+    # tri_centroids = (tri_verts.max(axis=1) + tri_verts.min(axis=1)) / 2
 
     pid = 0
     for f in range(F):
@@ -292,6 +320,7 @@ def extract_planar_patches(
             continue
     
         centroid_reg = (verts_region.max(axis=0) + verts_region.min(axis=0)) / 2
+        # centroid_reg = verts_region.mean(axis=0)
 
         patches.append(
             PlanarPatch(
@@ -316,10 +345,11 @@ def orient_patch_normals(mesh_quad: trimesh.Trimesh, patches, inward=False):
     # 오프셋 길이: 모델 크기 대비 아주 작게
     bbox_diag = float(np.linalg.norm(mesh_quad.bounds[1] - mesh_quad.bounds[0]))
     eps = 1e-2 * bbox_diag
+    # eps = 1
 
     for p in patches:
         n = np.asarray(p.normal if hasattr(p, "normal") else p["normal"], float)
-        n = n / (np.linalg.norm(n) + 1e-12)
+        n = unit(n)
         c = np.asarray(p.centroid if hasattr(p, "centroid") else p["centroid"], float)
 
         flip = False
@@ -376,14 +406,14 @@ def score_patch_pair(patch_a: PlanarPatch,
     c_b = np.asarray(patch_b.centroid)
     width = np.linalg.norm(c_a - c_b)
 
-    # TODO: c-n 최소 거리 점수: c-n 직선과 c간의 거리 점수(패치 2개의 평행성 검사 2)
+    # TODO: c-n 최소 거리 점수(모멘트): c-n 직선과 c간의 거리 점수(패치 2개의 평행성 검사 2)
     bbox_diag = float(np.linalg.norm(mesh_for_overlap.bounds[1] - mesh_for_overlap.bounds[0]))
     dist_a = point_line_distance(c_a, n_a, c_b)
     dist_b = point_line_distance(c_b, n_b, c_a)
     s_distance = 1 - (dist_a + dist_b) / bbox_diag
 
     # 최종 점수(가중합)
-    score = params.overlap_weight * s_overlap + params.distance_weight * s_distance
+    score = params.distance_weight * s_distance
 
     return PatchPairCandidate(
         patch_i=patch_a.id,
@@ -391,7 +421,10 @@ def score_patch_pair(patch_a: PlanarPatch,
         normal=n_a.tolist(),
         width=width,
         score=score,
-        terms={"overlap": s_overlap, "distance": s_distance},
+        terms={
+            "overlap": s_overlap,
+            "distance": s_distance
+               },
     )
 
 
@@ -445,6 +478,8 @@ def compute_best_patch_pairs(
             # 기존 폭/면적/점수 필터
             if cand.width < params.min_opening or cand.width > params.max_opening:
                 continue
+            if cand.terms['overlap'] <= 0: # 상호 겹치는 부분이 없는 pair는 넘김
+                continue
             if cand.score <= 0.0:
                 continue
             # print(i,j)
@@ -478,7 +513,7 @@ def check_gripper_feasibility(
     pad_w: float = PadParams.pad_w,     # 폭 (u 방향)
     pad_h: float = PadParams.pad_h,     # 높이 (v 방향)
     pad_d: float = PadParams.pad_d,      # 두께 (n 방향)
-    clearance_out: float = 50.0,   # 패드 바깥쪽 여유(접근 거리)
+    clearance_out: float = 20.0,   # 패드 바깥쪽 여유(접근 거리)
     use_mesh: str = "mesh_quad"    # 충돌검사에 사용할 메쉬 키: "mesh_quad" 권장
 ):
     """
@@ -519,20 +554,12 @@ def check_gripper_feasibility(
         collide_j = cm.in_collision_single(box_j)
         feasible = (not collide_i) and (not collide_j)
 
-        # if not feasible:
-        #     continue
-
         # --- 2) 모멘트 계산 (COM 기준) ---
-        ci = np.asarray(p_i["centroid"], float)
-        cj = np.asarray(p_j["centroid"], float)
-
-        # 그리퍼 수축 방향(p_i, p_j의 바깥 방향 normal의 반대)
-        Fi = unit(-np.asarray(p_i["normal"]))    # 1N 가정
-        Fj = unit(-np.asarray(p_j["normal"]))
-
-        ri = ci - com
-        rj = cj - com
-        tau = np.cross(ri, Fi) + np.cross(rj, Fj)
+        # 모멘트(평행 그리퍼 조임 방향: -n)
+        ci = np.asarray(p_i["centroid"], float);  cj = np.asarray(p_j["centroid"], float)
+        Fi = unit(-np.asarray(p_i["normal"], float))
+        Fj = unit(-np.asarray(p_j["normal"], float))
+        tau = np.cross(ci - com, Fi) + np.cross(cj - com, Fj)
         moment = float(np.linalg.norm(tau))
 
         report = dict(
@@ -547,5 +574,63 @@ def check_gripper_feasibility(
         reports,
         key=lambda r: (not r.get("feasible", False), r.get("moment", float("inf")))
     )
-
     return report_sorted
+
+# --- yaw만 스윕하여 feasibility 검사(+ 모멘트 계산/정렬) ---
+def check_gripper_feasibility_with_yaw(
+    result: dict,
+    pad_w: float = PadParams.pad_w,     # 폭 (u 방향)
+    pad_h: float = PadParams.pad_h,     # 높이 (v 방향)
+    pad_d: float = PadParams.pad_d,      # 두께 (n 방향)
+    clearance_out: float = 20.0,
+    yaw_grid_deg = [0, 90, 30, 60],
+    use_mesh: str = "mesh_quad"
+):
+    mesh    = result[use_mesh]
+    patches = {p["id"]: p for p in result["patches"]}
+    pairs   = result.get("top_k", [])
+
+    # COM
+    try:    com = mesh.center_mass
+    except: com = 0.5 * (mesh.bounds[0] + mesh.bounds[1])
+
+    cm = trimesh.collision.CollisionManager()
+    cm.add_object("part", mesh)
+
+    reports=[]
+    for k, cand in enumerate(pairs):
+        pid_i, pid_j = cand["patch_i"], cand["patch_j"]
+        if pid_i not in patches or pid_j not in patches:
+            reports.append(dict(pair_index=k, patch_i=pid_i, patch_j=pid_j,
+                                feasible=False))
+            continue
+        p_i, p_j = patches[pid_i], patches[pid_j]
+
+        feasible=False; feasible_yaw=None
+        for yaw in yaw_grid_deg:
+            box_i = make_rot_pad_box_at_patch(p_i, pad_w,pad_h,pad_d,clearance_out, yaw_deg= yaw)
+            box_j = make_rot_pad_box_at_patch(p_j, pad_w,pad_h,pad_d,clearance_out, yaw_deg=-yaw)
+            if cm.in_collision_single(box_i): continue
+            if cm.in_collision_single(box_j): continue
+            feasible=True; feasible_yaw=yaw
+            break
+
+        # 모멘트(평행 그리퍼 조임 방향: -n)
+        ci = np.asarray(p_i["centroid"], float);  cj = np.asarray(p_j["centroid"], float)
+        Fi = unit(-np.asarray(p_i["normal"], float))
+        Fj = unit(-np.asarray(p_j["normal"], float))
+        tau = np.cross(ci - com, Fi) + np.cross(cj - com, Fj)
+        moment = float(np.linalg.norm(tau))
+
+        report = dict(
+            pair_index=k,
+            patch_i=pid_i, patch_j=pid_j,
+            feasible=feasible,
+            feasible_yaw=feasible_yaw,
+            moment=moment
+        )
+        reports.append(report)
+
+    # feasible 우선, 모멘트 오름차순
+    reports_sorted = sorted(reports, key=lambda r: (not r.get("feasible", False), r.get("moment", float("inf"))))
+    return reports_sorted

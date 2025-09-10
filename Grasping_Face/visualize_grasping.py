@@ -8,10 +8,9 @@ from dataclasses import dataclass
 # -------------------------------
 @dataclass
 class PadParams:
-    pad_w: float = 15.0
-    pad_h: float = 20.0
-    pad_d: float = 5.0
-
+    pad_w: float = 34.0 # 34
+    pad_h: float = 21.0 # 21
+    pad_d: float = 7.0 # 7
 
 def unit(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     n = np.linalg.norm(v)
@@ -104,7 +103,16 @@ def basis_from_normal(n):
     u=unit(np.cross(n,a)); v=np.cross(n,u)
     return u,v,n
 
-def make_pad_box_at_patch(patch, pad_w, pad_h, pad_d, vis_extent: float = 3.0):
+def rotate_byaxis(axis, ang_deg):
+    axis = unit(axis)
+    th = np.deg2rad(ang_deg)
+    K = np.array([[0, -axis[2], axis[1]],
+                  [axis[2], 0, -axis[0]],
+                  [-axis[1], axis[0], 0]], float)
+    I = np.eye(3)
+    return I + np.sin(th)*K + (1-np.cos(th))*(K@K)
+
+def make_pad_box_at_patch(patch, pad_w, pad_h, pad_d):
     """
     패치 평면의 바깥쪽(+n)으로 'pad_d' 만큼 돌출된 OBB 생성
     + centroid에서 바깥쪽으로 lift_mm 만큼 추가 이격
@@ -116,15 +124,45 @@ def make_pad_box_at_patch(patch, pad_w, pad_h, pad_d, vis_extent: float = 3.0):
     u, v, n = basis_from_normal(n)
     c = np.asarray(patch["centroid"], float)
 
-    # ext_z = float(pad_d)
+    ext_z = float(pad_d)
     box = trimesh.creation.box(extents=[float(pad_w), float(pad_h), float(pad_d)])
 
     T = np.eye(4)
     T[:3, :3] = np.column_stack([u, v, n])
-    T[:3,  3] = c + n * (vis_extent)
+    T[:3,  3] = c + n*0.5*ext_z
     box.apply_transform(T)
+
     return box
 
+def make_pad_box_at_patch_with_yaw(patch, pad_w, pad_h, pad_d, yaw_deg):
+    """
+    패치 평면의 바깥쪽(+n)으로 'pad_d' 만큼 돌출된 OBB 생성
+    + centroid에서 바깥쪽으로 lift_mm 만큼 추가 이격
+    - extents: [pad_w, pad_h, pad_d]
+    - center : 패치 중심 + n * (extents_z/2)
+    - orientation: columns = [u, v, n]
+    """
+    n = unit(np.asarray(patch["normal"], float))
+    u, v, n = basis_from_normal(n)
+    c = np.asarray(patch["centroid"], float)
+
+    ext_z = float(pad_d)
+    box = trimesh.creation.box(extents=[float(pad_w), float(pad_h), float(pad_d)])
+
+    # 로컬 yaw 회전: R_world = B @ Rz(yaw)
+    B = np.column_stack([u, v, n])
+    cy, sy = np.cos(np.deg2rad(yaw_deg)), np.sin(np.deg2rad(yaw_deg))
+    Rz = np.array([[cy, -sy, 0.0],
+                   [sy,  cy, 0.0],
+                   [0.0, 0.0, 1.0]], float)
+    R_world = B @ Rz
+    n_world = R_world[:, 2]
+    T = np.eye(4)
+    T[:3, :3] = R_world
+    T[:3,  3] = c + n_world*0.5*ext_z
+    box.apply_transform(T)
+
+    return box
 
 # -------------------------------
 # 1) 추출된 패치 시각화
@@ -271,13 +309,14 @@ def visualize_feasible_pairs_pads(result, reports,
                                   pad_w=PadParams.pad_w,
                                   pad_h=PadParams.pad_h,
                                   pad_d=PadParams.pad_d,
-                                  vis_extent=3.0,
                                   show=False):
     mesh = result.get("mesh_quad", result.get("mesh_patches"))
     patches = {p["id"]: p for p in result["patches"]}
     pairs = result.get("top_k", [])
 
     ok_idx = [r["pair_index"] for r in reports if r.get("feasible")]
+    # print(ok_idx)
+
     if not ok_idx:
         raise ValueError("feasible pair가 없습니다.")
 
@@ -292,19 +331,27 @@ def visualize_feasible_pairs_pads(result, reports,
     for k, idx in enumerate(ok_idx):
         if idx >= len(pairs): continue
         cand = pairs[idx]
+        yaw_deg = reports[k]['feasible_yaw']
         pid_i, pid_j = cand["patch_i"], cand["patch_j"]
         if pid_i not in patches or pid_j not in patches: continue
         pi, pj = patches[pid_i], patches[pid_j]
-
         col = hsv(k, len(ok_idx), s=0.55, v=0.95)
 
-        # pad boxes
+        # # pad boxes
+        # try:
+        #     box_i = make_pad_box_at_patch(pi, pad_w, pad_h, pad_d)
+        #     box_j = make_pad_box_at_patch(pj, pad_w, pad_h, pad_d)
+        # except NameError:
+        #     box_i = make_pad_box_at_patch(pi, pad_w, pad_h, pad_d)
+        #     box_j = make_pad_box_at_patch(pj, pad_w, pad_h, pad_d)
+
+        # pad boxes + rot
         try:
-            box_i = make_pad_box_at_patch(pi, pad_w, pad_h, pad_d, vis_extent)
-            box_j = make_pad_box_at_patch(pj, pad_w, pad_h, pad_d, vis_extent)
+            box_i = make_pad_box_at_patch_with_yaw(pi, pad_w, pad_h, pad_d,  yaw_deg)
+            box_j = make_pad_box_at_patch_with_yaw(pj, pad_w, pad_h, pad_d, -yaw_deg)
         except NameError:
-            box_i = make_pad_box_at_patch(pi, pad_w, pad_h, pad_d, vis_extent)
-            box_j = make_pad_box_at_patch(pj, pad_w, pad_h, pad_d, vis_extent)
+            box_i = make_pad_box_at_patch_with_yaw(pi, pad_w, pad_h, pad_d,  yaw_deg)
+            box_j = make_pad_box_at_patch_with_yaw(pj, pad_w, pad_h, pad_d, -yaw_deg)
 
         # legendgroup으로 두 pad를 하나의 토글 그룹에 묶기
         lg = f"pair {idx}"
