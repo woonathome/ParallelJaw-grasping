@@ -24,8 +24,9 @@ class PatchPairParams:
     max_opening: float = 140.0
     angle_tolerance_deg: float = 15.0
     # parallel_weight: float = 0.2 # TODO: 추후 다른 기준 추가 시 조정
-    # overlap_weight:   float = 0.3 # TODO: 추후 다른 기준 추가 시 조정
-    distance_weight:  float = 1.0 # TODO: 추후 다른 기준 추가 시 조정
+    overlap_weight:   float = 1 # TODO: 추후 다른 기준 추가 시 조정
+    distance_weight:  float = 1 # TODO: 추후 다른 기준 추가 시 조정
+    inertia_weight:   float = 1 # TODO: 추후 다른 기준 추가 시 조정
     samples_per_face= 3          # face 샘플링 개수
 
 
@@ -80,8 +81,52 @@ def load_uniform_mesh_with_open3d(path, target_triangles=500, min_area=5): # TOD
     F = F[mask]
 
     # 4) Trimesh로 반환
-    remeshed = trimesh.Trimesh(vertices=V, faces=F, process=True)
-    return remeshed, mesh_quad
+    mesh_filter = trimesh.Trimesh(vertices=V, faces=F, process=True)
+    return mesh_filter, mesh_quad
+
+def split_long_edges(mesh: trimesh.Trimesh, max_iter: int = 10):
+    """
+    삼각형별 긴 edge를 기준으로 반복 subdivide
+    - mesh: trimesh.Trimesh
+    - max_iter: 무한 루프 방지를 위한 최대 반복 횟수
+    """
+    bbox_diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+    max_len = bbox_diag * 0.3 # max_len: 허용하는 최대 edge 길이
+
+    V = mesh.vertices.copy()
+    F = mesh.faces.copy()
+
+    for it in range(max_iter):
+        new_faces = []
+        added = False
+
+        for f in F:
+            tri = V[f]
+            # edge 길이 계산
+            edges = [(0,1), (1,2), (2,0)]
+            lens = [np.linalg.norm(tri[i] - tri[j]) for i,j in edges]
+            max_idx = int(np.argmax(lens))
+            i,j = edges[max_idx]
+            if lens[max_idx] > max_len:
+                added = True
+                # 중점 추가
+                mid = 0.5 * (tri[i] + tri[j])
+                V = np.vstack([V, mid])
+                mid_idx = len(V) - 1
+
+                k = 3 - i - j  # 나머지 점 인덱스
+                # 삼각형을 두 개로 분할
+                new_faces.append([f[i], mid_idx, f[k]])
+                new_faces.append([mid_idx, f[j], f[k]])
+            else:
+                new_faces.append(f)
+
+        F = np.array(new_faces, dtype=np.int64)
+
+        if not added:  # 더 이상 분할 필요 없음
+            break
+
+    return trimesh.Trimesh(vertices=V, faces=F, process=True)
 
 
 # --------------------------
@@ -140,6 +185,18 @@ def rotate_byaxis(axis, ang_deg):
                   [-axis[1], axis[0], 0]], float)
     I = np.eye(3)
     return I + np.sin(th)*K + (1-np.cos(th))*(K@K)
+
+def rotate_vector_about_axis(v, axis, ang_deg):
+    """
+    v: 회전시킬 벡터
+    axis: 회전축 (정규화)
+    ang_deg: 회전 각도 (deg)
+    """
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    theta = np.deg2rad(ang_deg)
+    v = np.asarray(v, dtype=float)
+    c, s = np.cos(theta), np.sin(theta)
+    return v * c + np.cross(axis, v) * s + axis * (np.dot(axis, v)) * (1 - c)
 
 def sample_points_on_patch(mesh: trimesh.Trimesh, face_idx, samples_per_face):
     faces = mesh.faces[np.asarray(list(face_idx), dtype=int)]
@@ -241,7 +298,8 @@ def make_rot_pad_box_at_patch(patch, pad_w, pad_h, pad_d, clearance_out,
     c = np.asarray(patch["centroid"], float)
 
     ext_z = float(pad_d + clearance_out)
-    box = trimesh.creation.box(extents=[float(pad_w) / 2, float(pad_h) / 2, ext_z])
+    # box = trimesh.creation.box(extents=[float(pad_w) / 2, float(pad_h) / 2, ext_z])
+    box = trimesh.creation.box(extents=[float(pad_w), float(pad_h), ext_z])
 
     # 로컬 yaw 회전: R_world = B @ Rz(yaw)
     B = np.column_stack([u, v, n])
@@ -264,12 +322,14 @@ def extract_planar_patches(
     mesh: trimesh.Trimesh,
     angle_deg: float = 15.0,
     coplanar_tol: float = 1e-3,
-    min_patch_area: float = 20.0, # TODO: min_patch_area 기준 업데이트 필요
 ) -> List[PlanarPatch]:
     face_normals = mesh.face_normals
     faces = mesh.faces
     face_adjacency = mesh.face_adjacency
     F = len(faces)
+
+    min_patch_area = mesh.area * 0.0001 
+    # max_patch_area = mesh.area * 0.0001
 
     neighbors = [[] for _ in range(F)]
     for f0, f1 in face_adjacency:
@@ -336,6 +396,7 @@ def extract_planar_patches(
 
     return patches
 
+
 def orient_patch_normals(mesh_quad: trimesh.Trimesh, patches, inward=False):
     """
     패치 법선을 mesh 기준으로 일관되게 정렬.
@@ -353,6 +414,8 @@ def orient_patch_normals(mesh_quad: trimesh.Trimesh, patches, inward=False):
         c = np.asarray(p.centroid if hasattr(p, "centroid") else p["centroid"], float)
 
         flip = False
+
+        mesh_quad.contains([c + eps * n])[0]
 
         outside = not mesh_quad.contains([c + eps * n])[0]
         if inward:
@@ -401,19 +464,25 @@ def score_patch_pair(patch_a: PlanarPatch,
                                            samples_per_face=params.samples_per_face)
     s_overlap = overlap_a * overlap_b
 
-    # TODO: width patch 간 최소 거리로 업뎃 필요 (현재: centroid 간 거리)
+    # width patch 간 최소 거리로 업뎃 필요 (현재: centroid 간 거리)
     c_a = np.asarray(patch_a.centroid)
     c_b = np.asarray(patch_b.centroid)
     width = np.linalg.norm(c_a - c_b)
 
-    # TODO: c-n 최소 거리 점수(모멘트): c-n 직선과 c간의 거리 점수(패치 2개의 평행성 검사 2)
+    # TODO: c-n 최소 거리 점수: c-n 직선과 c간의 거리 점수(패치 2개의 평행성 검사 2)
     bbox_diag = float(np.linalg.norm(mesh_for_overlap.bounds[1] - mesh_for_overlap.bounds[0]))
     dist_a = point_line_distance(c_a, n_a, c_b)
     dist_b = point_line_distance(c_b, n_b, c_a)
     s_distance = 1 - (dist_a + dist_b) / bbox_diag
 
+    # TODO: 회전 관성 점수: ca-cb 직선과 mesh COM 간 거리 점수
+    com_mesh = mesh_for_overlap.center_mass
+    direction = (c_a - c_b) / width
+    dist_inertia = point_line_distance(c_b, direction, com_mesh)
+    s_inertia = 1 - dist_inertia / bbox_diag
+
     # 최종 점수(가중합)
-    score = params.distance_weight * s_distance
+    score = params.distance_weight * s_distance + params.overlap_weight * s_overlap + params.inertia_weight * s_inertia
 
     return PatchPairCandidate(
         patch_i=patch_a.id,
@@ -423,8 +492,9 @@ def score_patch_pair(patch_a: PlanarPatch,
         score=score,
         terms={
             "overlap": s_overlap,
-            "distance": s_distance
-               },
+            "distance": s_distance,
+            "inertia": s_inertia
+              },
     )
 
 
@@ -443,8 +513,9 @@ def compute_best_patch_pairs(
     top_k: int = 1,                        # 상위 후보 수
 ) -> Dict[str, Any]:
     
-    remesh, mesh_quad = load_uniform_mesh_with_open3d(mesh_path, target_triangles=mesh_max_triangles)
-    # remesh(면적 기준 필터링 이후, watertight X), mesh_quad: (면적 기준 필터링 이전, watertight O)
+    mesh_filter, mesh_quad = load_uniform_mesh_with_open3d(mesh_path, target_triangles=mesh_max_triangles)
+    # mesh_filter: (면적 기준 필터링 이후, watertight X), mesh_quad: (면적 기준 필터링 이전, watertight O)
+    remesh = split_long_edges(mesh_filter)
 
     patches = extract_planar_patches(remesh, angle_deg=angle_deg, coplanar_tol=coplanar_tol)
     patches = orient_patch_normals(mesh_quad, patches, inward=False)  # false: 모두 바깥쪽으로 정렬
@@ -465,11 +536,9 @@ def compute_best_patch_pairs(
         best_score = -1.0
 
         for j in range(i + 1, len(patches)):
-            # i-j 법선 각도
+            # i-j 법선 각도: 180° - tol 보다 작으면 충분히 반대가 아님 -> 스킵
             dot = float(ni @ nvecs[j])
             ang = math.degrees(math.acos(max(-1.0, min(1.0, dot))))
-
-            # 180° - tol 보다 작으면 충분히 반대가 아님 -> 스킵
             if ang < 180.0 - params.angle_tolerance_deg:
                 continue
 
@@ -483,7 +552,6 @@ def compute_best_patch_pairs(
             if cand.score <= 0.0:
                 continue
             # print(i,j)
-
 
             # i에 대해 최고 점수만 유지
             if cand.score > best_score:
@@ -508,82 +576,14 @@ def compute_best_patch_pairs(
     }
 
 
-def check_gripper_feasibility(
-    result: dict,
-    pad_w: float = PadParams.pad_w,     # 폭 (u 방향)
-    pad_h: float = PadParams.pad_h,     # 높이 (v 방향)
-    pad_d: float = PadParams.pad_d,      # 두께 (n 방향)
-    clearance_out: float = 20.0,   # 패드 바깥쪽 여유(접근 거리)
-    use_mesh: str = "mesh_quad"    # 충돌검사에 사용할 메쉬 키: "mesh_quad" 권장
-):
-    """
-    result['top_k']의 각 pair에 대해 pad approach OBB와 메쉬 충돌 검사.
-    충돌 없음: feasible=True
-    반환: [{pair_index, patch_i, patch_j, feasible}] 리스트
-    """
-    mesh = result[use_mesh]
-    patches = {p["id"]: p for p in result["patches"]}
-    cands = result.get("top_k", [])
-
-    # COM (fallback: bbox center)
-    try:
-        com = mesh.center_mass
-    except Exception:
-        bmin, bmax = mesh.bounds
-        com = 0.5 * (bmin + bmax)
-
-    # 충돌 매니저 준비(메쉬 1회 등록)
-    cm = CollisionManager()
-    cm.add_object("part", mesh)
-
-    reports = []
-    for k, cand in enumerate(cands):
-        pid_i, pid_j = cand["patch_i"], cand["patch_j"]
-        if pid_i not in patches or pid_j not in patches:
-            reports.append(dict(pair_index=k, patch_i=pid_i, patch_j=pid_j,
-                                feasible=False))
-            continue
-        p_i, p_j = patches[pid_i], patches[pid_j]
-
-        # --- 1) pad OBB 생성 & 충돌 검사 ---
-        # 양쪽 패드 OBB 생성
-        box_i = make_pad_box_at_patch(p_i, pad_w, pad_h, pad_d, clearance_out)
-        box_j = make_pad_box_at_patch(p_j, pad_w, pad_h, pad_d, clearance_out)
-        # 충돌 검사 (각각 독립적으로 검사)
-        collide_i = cm.in_collision_single(box_i)
-        collide_j = cm.in_collision_single(box_j)
-        feasible = (not collide_i) and (not collide_j)
-
-        # --- 2) 모멘트 계산 (COM 기준) ---
-        # 모멘트(평행 그리퍼 조임 방향: -n)
-        ci = np.asarray(p_i["centroid"], float);  cj = np.asarray(p_j["centroid"], float)
-        Fi = unit(-np.asarray(p_i["normal"], float))
-        Fj = unit(-np.asarray(p_j["normal"], float))
-        tau = np.cross(ci - com, Fi) + np.cross(cj - com, Fj)
-        moment = float(np.linalg.norm(tau))
-
-        report = dict(
-            pair_index=k,
-            patch_i=pid_i, patch_j=pid_j,
-            feasible=feasible,
-            moment=moment
-        )
-        reports.append(report)
-
-    report_sorted = sorted( # Feasible, moment 정렬
-        reports,
-        key=lambda r: (not r.get("feasible", False), r.get("moment", float("inf")))
-    )
-    return report_sorted
-
-# --- yaw만 스윕하여 feasibility 검사(+ 모멘트 계산/정렬) ---
+# --- yaw 스윕하여 feasibility 검사(+ 모멘트 계산/정렬) ---
 def check_gripper_feasibility_with_yaw(
     result: dict,
     pad_w: float = PadParams.pad_w,     # 폭 (u 방향)
     pad_h: float = PadParams.pad_h,     # 높이 (v 방향)
     pad_d: float = PadParams.pad_d,      # 두께 (n 방향)
     clearance_out: float = 20.0,
-    yaw_grid_deg = [0, 90, 30, 60],
+    yaw_grid_deg = [0, 90, 30, -30, 60, -60],
     use_mesh: str = "mesh_quad"
 ):
     mesh    = result[use_mesh]
@@ -634,3 +634,201 @@ def check_gripper_feasibility_with_yaw(
     # feasible 우선, 모멘트 오름차순
     reports_sorted = sorted(reports, key=lambda r: (not r.get("feasible", False), r.get("moment", float("inf"))))
     return reports_sorted
+
+# --- yaw 스윕하여 feasibility 검사(+ 모멘트 계산/정렬) ---
+def check_gripper_feasibility_faces_with_yaw(
+    result: dict,
+    pad_w: float = PadParams.pad_w,
+    pad_h: float = PadParams.pad_h,
+    pad_d: float = PadParams.pad_d,
+    clearance_out: float = 20.0,
+    yaw_grid_deg = [0, 90, 30, -30, 60, -60],
+    use_mesh: str = "mesh_patches",
+    check_mesh: str = "mesh_quad"
+):
+    mesh_ch = result[check_mesh] # 간섭 검사용: 면적 필터 안 된 메시 
+    mesh    = result[use_mesh]
+    patches = {p["id"]: p for p in result["patches"]}
+    pairs   = result.get("top_k", [])
+
+    try:    com = mesh_ch.center_mass
+    except: com = 0.5 * (mesh_ch.bounds[0] + mesh_ch.bounds[1])
+
+    cm = trimesh.collision.CollisionManager()
+    cm.add_object("part", mesh_ch) # 간섭 검사용: 면적 필터 안 된 메시 
+
+    reports = []
+    for k, cand in enumerate(pairs):
+        pid_i, pid_j = cand["patch_i"], cand["patch_j"]
+        if pid_i not in patches or pid_j not in patches:
+            reports.append(dict(pair_index=k, feasible=False))
+            continue
+        p_i, p_j = patches[pid_i], patches[pid_j]
+        n_i = unit(np.asarray(p_i["normal"], float))
+        n_j = unit(np.asarray(p_j["normal"], float))
+
+        best_overall = None  # 이 pair에서 모멘트가 가장 작은 (f_i, f_j) 1개
+        for f_i in p_i["face_indices"]:
+            ci = mesh.vertices[mesh.faces[f_i]].mean(axis=0)
+
+            # f_i에 대해 "가장 평행"한 f_j 하나만 선택 (dot 기반 점수)
+            best_j   = None
+            best_cj  = None
+            best_scr = -1.0
+            for f_j in p_j["face_indices"]:
+                cj = mesh.vertices[mesh.faces[f_j]].mean(axis=0)
+                d  = cj - ci
+                nd = np.linalg.norm(d)
+                if nd < 1e-12:  # 동일점 방지
+                    continue
+                d_hat = d / nd
+                # d가 (-n_i)와, -d가 n_j와 각각 평행할수록 점수↑ → 곱으로 통합
+                scr = abs(float(d_hat @ (-n_i))) * abs(float((-d_hat) @ n_j))
+                if scr > best_scr:
+                    best_scr, best_j, best_cj = scr, f_j, cj
+            if best_j is None:
+                continue
+
+            # 선택된 (f_i, best_j)에 대해서만 yaw sweep + 충돌 검사
+            feasible = False
+            yaw_ok   = None
+            for yaw in yaw_grid_deg:
+                box_i = make_rot_pad_box_at_patch(
+                    {"centroid": ci,     "normal": n_i},
+                    pad_w, pad_h, pad_d, clearance_out, yaw_deg= yaw
+                )
+                box_j = make_rot_pad_box_at_patch(
+                    {"centroid": best_cj,"normal": n_j},
+                    pad_w, pad_h, pad_d, clearance_out, yaw_deg=-yaw
+                )
+                if cm.in_collision_single(box_i): continue
+                if cm.in_collision_single(box_j): continue
+                feasible = True
+                yaw_ok   = yaw
+                break
+
+            if not feasible:
+                continue
+
+            # 모멘트 계산 (조임 방향은 -n)
+            Fi = -n_i; Fj = -n_j
+            tau = np.cross(ci - com, Fi) + np.cross(best_cj - com, Fj)
+            moment = float(np.linalg.norm(tau))
+
+            cand_report = dict(
+                pair_index=k,
+                patch_i=pid_i, patch_j=pid_j,
+                face_i=f_i, face_j=best_j,
+                feasible=True,
+                feasible_yaw=yaw_ok,
+                moment=moment
+            )
+            if (best_overall is None) or (moment < best_overall["moment"]):
+                best_overall = cand_report
+
+        # pair별 최종 1개만 저장
+        if best_overall is None:
+            reports.append(dict(pair_index=k, patch_i=pid_i, patch_j=pid_j, feasible=False))
+        else:
+            reports.append(best_overall)
+
+    # feasible 우선, 모멘트 오름차순
+    reports_sorted = sorted(
+        reports, key=lambda r: (not r.get("feasible", False), r.get("moment", float("inf")))
+    )
+    return reports_sorted
+
+
+# --------------------------
+# Object Pose helpers
+# --------------------------
+def Rotx(a):
+    c,s=np.cos(np.deg2rad(a)),np.sin(np.deg2rad(a))
+    return np.array([[1,0,0],[0,c,-s],[0,s,c]])
+def Roty(a):
+    c,s=np.cos(np.deg2rad(a)),np.sin(np.deg2rad(a))
+    return np.array([[c,0,s],[0,1,0],[-s,0,c]])
+def Rotz(a):
+    c,s=np.cos(np.deg2rad(a)),np.sin(np.deg2rad(a))
+    return np.array([[c,-s,0],[s,c,0],[0,0,1]])
+def to44(R,t):
+    H=np.eye(4); H[:3,:3]=R
+    H[:3,3]=np.asarray(t).reshape(3)
+    return H
+
+def origin_offset_from_stroke(stroke):
+    _STROKE_TO_DIST = {
+        0:82, 9:81, 18:80, 35:80, 67:77, 96:71, 122:63, 145:52
+    }
+    _strokes = np.array(list(_STROKE_TO_DIST.keys()), dtype=float)
+    _dists   = np.array(list(_STROKE_TO_DIST.values()), dtype=float)
+    return float(np.interp(float(stroke), _strokes, _dists))
+
+# object 좌표계에서 본 gripper pose (H_GO)
+def build_gripper_pose_obj(p_i, p_j, yaw_deg=0.0):
+    """
+    객체 좌표계 상 두 패치 pair로부터 그리퍼 좌표계 pose 생성.
+    - origin: 두 centroid의 중점 (패드 중앙)
+    - x축: i -j 평균  (closing 방향) 
+    반환: (4x4 pose 행렬, stroke=패드 거리)
+    """
+    ci = np.asarray(p_i["centroid"], float)
+    cj = np.asarray(p_j["centroid"], float)
+    ni = np.asarray(p_i["normal"], float)
+    nj = np.asarray(p_j["normal"], float)
+
+    # origin = 중점
+    o_pad = 0.5 * (ci + cj)
+
+    # closing 방향 (x축)
+    x_axis = unit(ni - nj) # make_box_rot 함수에서 pad_i normal yaw_deg 회전
+    u, v, n = basis_from_normal(x_axis)
+    B = np.column_stack([u, v, n])
+    Rz = Rotz(yaw_deg)
+    R_world = B @ Rz
+    z_axis =   R_world[:, 0]  # pad w 방향
+    y_axis = - R_world[:, 1]  # pad h 방향
+    x_axis =   R_world[:, 2]  # closing 방향
+
+    if z_axis[-1] >= 0:
+        # R_world = np.linalg.inv(R_world)
+        z_axis = - z_axis  # pad w 방향
+        y_axis = - y_axis  # pad h 방향
+        x_axis = - x_axis  # closing 방향
+
+    # 직교 보정 (x,y,z 순서)
+    R = np.column_stack([x_axis, y_axis, z_axis])
+
+    # 그리퍼 stroke에 따른 그리퍼 원점 업데이트 (z축 반대방향으로 stroke offset 만큼 이동)
+    stroke = np.linalg.norm(cj - ci)
+    d = origin_offset_from_stroke(stroke)
+    o = o_pad + (- z_axis * d)
+    H_OG = to44(R, o)
+
+    return H_OG, stroke
+
+def ee_delta_pose_des(H_OC: np.ndarray, H_OG: np.ndarray):
+    """
+    n: now(캡쳐 위치), d: destination(인식된 위치)
+    입력:
+      H_OC : C좌표계 기준 O좌표계 원점 포즈
+      H_OG : O좌표계 기준 G좌표계 원점 포즈
+    출력:
+      H_EdEn : now EE 기준 des EE 포즈 (EE 움직일 상대 좌표)
+    """
+    # 좌표계 시각화
+    H_E = np.eye(4,4) # TODO: 로봇 컨트롤러 신호 받아 변환행렬 만들기
+
+    # 고정변환
+    H_GnEn = to44(Rotx(180) @ Rotz(90), [0,0,-135])   # EE -> Grip (TODO 위 반영 업뎃)
+    H_GnCn = to44(np.eye(3), [0,48,6])           # Cam -> Grip
+    H_CnGn = np.linalg.inv(H_GnCn)
+    H_CnEn = H_GnEn @ H_CnGn                        # EE -> Cam
+    H_EG = np.linalg.inv(H_GnEn)
+
+    H_OdCn = H_OC
+    H_OdEn = H_CnEn @ H_OdCn
+    # H_GdOd = np.linalg.inv(H_OG)
+    H_GdEn = H_OdEn @ H_OG
+    H_EdEn = H_GdEn @ H_EG
+    return H_EdEn, H_OdEn

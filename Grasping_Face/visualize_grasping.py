@@ -164,6 +164,91 @@ def make_pad_box_at_patch_with_yaw(patch, pad_w, pad_h, pad_d, yaw_deg):
 
     return box
 
+def frame_traces(H, name, scale=20.0, legendgroup=None, showlegend=False):
+    """
+    4x4 pose 행렬 H 기준 좌표축(x=red, y=green, z=blue) 시각화
+    """
+    o = H[:3, 3]
+    x_axis = o + H[:3, 0] * scale
+    y_axis = o + H[:3, 1] * scale
+    z_axis = o + H[:3, 2] * scale
+    traces = []
+    traces.append(go.Scatter3d(x=[o[0],x_axis[0]], y=[o[1],x_axis[1]], z=[o[2],x_axis[2]],
+                               mode="lines", line=dict(color="red", width=6),
+                               name=f"{name}-x", legendgroup=legendgroup, showlegend=showlegend))
+    traces.append(go.Scatter3d(x=[o[0],y_axis[0]], y=[o[1],y_axis[1]], z=[o[2],y_axis[2]],
+                               mode="lines", line=dict(color="green", width=6),
+                               name=f"{name}-y", legendgroup=legendgroup, showlegend=showlegend))
+    traces.append(go.Scatter3d(x=[o[0],z_axis[0]], y=[o[1],z_axis[1]], z=[o[2],z_axis[2]],
+                               mode="lines", line=dict(color="blue", width=6),
+                               name=f"{name}-z", legendgroup=legendgroup, showlegend=showlegend))
+    return traces
+
+def Rotx(a):
+    c,s=np.cos(np.deg2rad(a)),np.sin(np.deg2rad(a))
+    return np.array([[1,0,0],[0,c,-s],[0,s,c]])
+def Roty(a):
+    c,s=np.cos(np.deg2rad(a)),np.sin(np.deg2rad(a))
+    return np.array([[c,0,s],[0,1,0],[-s,0,c]])
+def Rotz(a):
+    c,s=np.cos(np.deg2rad(a)),np.sin(np.deg2rad(a))
+    return np.array([[c,-s,0],[s,c,0],[0,0,1]])
+def to44(R,t):
+    H=np.eye(4); H[:3,:3]=R
+    H[:3,3]=np.asarray(t).reshape(3)
+    return H
+
+def origin_offset_from_stroke(stroke):
+    _STROKE_TO_DIST = {
+        0:82, 9:81, 18:80, 35:80, 67:77, 96:71, 122:63, 145:52
+    }
+    _strokes = np.array(list(_STROKE_TO_DIST.keys()), dtype=float)
+    _dists   = np.array(list(_STROKE_TO_DIST.values()), dtype=float)
+    return float(np.interp(float(stroke), _strokes, _dists))
+
+# object 좌표계에서 본 gripper pose (H_GO)
+def build_gripper_pose_obj(p_i, p_j, yaw_deg=0.0):
+    """
+    객체 좌표계 상 두 패치 pair로부터 그리퍼 좌표계 pose 생성.
+    - origin: 두 centroid의 중점 (패드 중앙)
+    - x축: i -j 평균  (closing 방향) 
+    반환: (4x4 pose 행렬, stroke=패드 거리)
+    """
+    ci = np.asarray(p_i["centroid"], float)
+    cj = np.asarray(p_j["centroid"], float)
+    ni = np.asarray(p_i["normal"], float)
+    nj = np.asarray(p_j["normal"], float)
+
+    # origin = 중점d
+    o_pad = 0.5 * (ci + cj)
+
+    # closing 방향 (x축)
+    x_axis = unit(ni - nj) # make_box_rot 함수에서 pad_i normal yaw_deg 회전
+    u, v, n = basis_from_normal(x_axis)
+    B = np.column_stack([u, v, n])
+    Rz = Rotz(yaw_deg)
+    R_world = B @ Rz
+    z_axis = R_world[:, 0]  # pad w 방향
+    y_axis = - R_world[:, 1]  # pad h 방향
+    x_axis = R_world[:, 2]  # closing 방향
+
+    if z_axis[-1] >= 0:
+        # R_world = np.linalg.inv(R_world)
+        z_axis = - z_axis  # pad w 방향
+        y_axis = - y_axis  # pad h 방향
+        x_axis = - x_axis  # closing 방향
+
+    # 직교 보정 (x,y,z 순서)
+    R = np.column_stack([x_axis, y_axis, z_axis])
+
+    # 그리퍼 stroke에 따른 그리퍼 원점 업데이트 (z축 반대방향으로 stroke offset 만큼 이동)
+    stroke = np.linalg.norm(cj - ci)
+    d = origin_offset_from_stroke(stroke)
+    o = o_pad + (- z_axis * d)
+    H_GO = to44(R, o)
+
+    return H_GO, stroke
+
 # -------------------------------
 # 1) 추출된 패치 시각화
 # -------------------------------
@@ -203,7 +288,7 @@ def visualize_merged_patches_plotly(result,
             traces.append(edge)
 
     # normals(검정)
-    traces.append(cones_for_normals(patches, mesh_bounds=mesh_sil.bounds, normal_scale=100.0,
+    traces.append(cones_for_normals(patches, mesh_bounds=mesh_sil.bounds, normal_scale=50.0,
                                      min_len_ratio=0.1, color=normal_color, name="normals"))
     
     fig = go.Figure(traces)
@@ -219,7 +304,7 @@ def visualize_merged_patches_plotly(result,
         )
     )
     if show:
-        fig.show()
+        fig.show(renderer="browser")
 
     return fig
 
@@ -297,7 +382,7 @@ def visualize_pairs_centroid_lines(result,
         )
     )
     if show:
-        fig.show()
+        fig.show(renderer="browser")
 
     return fig
 
@@ -310,7 +395,8 @@ def visualize_feasible_pairs_pads(result, reports,
                                   pad_h=PadParams.pad_h,
                                   pad_d=PadParams.pad_d,
                                   show=False):
-    mesh = result.get("mesh_quad", result.get("mesh_patches"))
+    mesh = result.get("mesh_quad")
+    mesh_patches = result.get("mesh_patches")
     patches = {p["id"]: p for p in result["patches"]}
     pairs = result.get("top_k", [])
 
@@ -337,26 +423,113 @@ def visualize_feasible_pairs_pads(result, reports,
         pi, pj = patches[pid_i], patches[pid_j]
         col = hsv(k, len(ok_idx), s=0.55, v=0.95)
 
-        # # pad boxes
-        # try:
-        #     box_i = make_pad_box_at_patch(pi, pad_w, pad_h, pad_d)
-        #     box_j = make_pad_box_at_patch(pj, pad_w, pad_h, pad_d)
-        # except NameError:
-        #     box_i = make_pad_box_at_patch(pi, pad_w, pad_h, pad_d)
-        #     box_j = make_pad_box_at_patch(pj, pad_w, pad_h, pad_d)
-
         # pad boxes + rot
-        try:
-            box_i = make_pad_box_at_patch_with_yaw(pi, pad_w, pad_h, pad_d,  yaw_deg)
-            box_j = make_pad_box_at_patch_with_yaw(pj, pad_w, pad_h, pad_d, -yaw_deg)
-        except NameError:
-            box_i = make_pad_box_at_patch_with_yaw(pi, pad_w, pad_h, pad_d,  yaw_deg)
-            box_j = make_pad_box_at_patch_with_yaw(pj, pad_w, pad_h, pad_d, -yaw_deg)
+        fi, fj = reports[k]["face_i"], reports[k]["face_j"]
+        ni = unit(np.asarray(pi["normal"], float))
+        nj = unit(np.asarray(pj["normal"], float))
+        ci = mesh_patches.vertices[mesh_patches.faces[fi]].mean(axis=0)
+        cj = mesh_patches.vertices[mesh_patches.faces[fj]].mean(axis=0)
+        box_i = make_pad_box_at_patch_with_yaw({"centroid": ci, "normal": ni}, pad_w, pad_h, pad_d, yaw_deg= yaw_deg)
+        box_j = make_pad_box_at_patch_with_yaw({"centroid": cj, "normal": nj}, pad_w, pad_h, pad_d, yaw_deg=-yaw_deg)
+        # ci = np.asarray(pi["centroid"], float)
+        # cj = np.asarray(pj["centroid"], float)
+        # box_i = make_pad_box_at_patch_with_yaw(pi, pad_w, pad_h, pad_d,  yaw_deg)
+        # box_j = make_pad_box_at_patch_with_yaw(pj, pad_w, pad_h, pad_d, -yaw_deg)
 
         # legendgroup으로 두 pad를 하나의 토글 그룹에 묶기
         lg = f"pair {idx}"
+        # ci = np.asarray(pi["centroid"], float); cj = np.asarray(pj["centroid"], float)
         # proxy(범례 핸들) – 클릭 시 그룹 전체 토글
-        ci = np.asarray(pi["centroid"], float); cj = np.asarray(pj["centroid"], float)
+        traces.append(go.Scatter3d(
+            x=[ci[0]], y=[ci[1]], z=[ci[2]],
+            mode="markers", marker=dict(size=1, opacity=0.0),
+            name=lg, legendgroup=lg, showlegend=True))
+        # pad_i
+        x,y,z = box_i.vertices.T; I,J,K = box_i.faces.T
+        traces.append(go.Mesh3d(x=x,y=y,z=z,i=I,j=J,k=K,
+                                color=col, opacity=0.2,
+                                name=f"{lg} - pad_i", legendgroup=lg, showlegend=False))
+        # pad_j
+        x,y,z = box_j.vertices.T; I,J,K = box_j.faces.T
+        traces.append(go.Mesh3d(x=x,y=y,z=z,i=I,j=J,k=K,
+                                color=col, opacity=0.2,
+                                name=f"{lg} - pad_j", legendgroup=lg, showlegend=False))
+        # 중심선
+        traces.append(go.Scatter3d(
+            x=[ci[0], cj[0]], y=[ci[1], cj[1]], z=[ci[2], cj[2]],
+            mode="lines", line=dict(color=col, width=5),
+            name=f"{lg} - centerline", legendgroup=lg, showlegend=False))
+
+    fig = go.Figure(traces)
+    fig.update_layout(
+        title=f"Feasible Pairs — Pads only (count={len(ok_idx)})",
+        margin=dict(l=0,r=0,t=48,b=0),
+        showlegend=True,
+        legend=dict(groupclick="togglegroup"),  # ← 그룹 단위 토글
+        scene=dict(
+            xaxis=dict(range=[cx-max_range, cx+max_range], showgrid=False, zeroline=False),
+            yaxis=dict(range=[cy-max_range, cy+max_range], showgrid=False, zeroline=False),
+            zaxis=dict(range=[cz-max_range, cz+max_range], showgrid=False, zeroline=False),
+            aspectmode="cube"
+        )
+    )
+    if show:
+        fig.show(renderer="browser")
+
+    return fig
+
+
+# -------------------------------
+# 4) feasible patch pair + 그리퍼 좌표계
+# -------------------------------
+def visualize_feasible_pairs_pads_gripper(result, reports,
+                                        show_silhouette=True,
+                                        pad_w=PadParams.pad_w,
+                                        pad_h=PadParams.pad_h,
+                                        pad_d=PadParams.pad_d,
+                                        show=False):
+    mesh = result.get("mesh_quad")
+    mesh_patches = result.get("mesh_patches")
+    patches = {p["id"]: p for p in result["patches"]}
+    pairs = result.get("top_k", [])
+
+    ok_idx = [r["pair_index"] for r in reports if r.get("feasible")]
+    if not ok_idx:
+        raise ValueError("feasible pair가 없습니다.")
+
+    (xmin, ymin, zmin), (xmax, ymax, zmax) = mesh.bounds
+    cx, cy, cz = (xmax+xmin)/2, (ymax+ymin)/2, (zmax+zmin)/2
+    max_range  = max(xmax-xmin,ymax-ymin,zmax-zmin)
+
+    traces=[]
+    if show_silhouette:
+        traces.append(mesh3d_from_trimesh(mesh, color="#cfcfcf", opacity=0.8, name="mesh"))
+
+    for k, idx in enumerate(ok_idx):
+        if idx >= len(pairs): continue
+        cand = pairs[idx]
+        yaw_deg = reports[k].get('feasible_yaw', 0.0)
+        pid_i, pid_j = cand["patch_i"], cand["patch_j"]
+        if pid_i not in patches or pid_j not in patches: continue
+        pi, pj = patches[pid_i], patches[pid_j]
+        col = hsv(k, len(ok_idx), s=0.55, v=0.95)
+
+        # pad boxes + rot
+        fi, fj = reports[k]["face_i"], reports[k]["face_j"]
+        ni = unit(np.asarray(pi["normal"], float))
+        nj = unit(np.asarray(pj["normal"], float))
+        ci = mesh_patches.vertices[mesh_patches.faces[fi]].mean(axis=0)
+        cj = mesh_patches.vertices[mesh_patches.faces[fj]].mean(axis=0)
+        box_i = make_pad_box_at_patch_with_yaw({"centroid": ci, "normal": ni}, pad_w, pad_h, pad_d, yaw_deg= yaw_deg)
+        box_j = make_pad_box_at_patch_with_yaw({"centroid": cj, "normal": nj}, pad_w, pad_h, pad_d, yaw_deg=-yaw_deg)
+        # ci = np.asarray(pi["centroid"], float)
+        # cj = np.asarray(pj["centroid"], float)
+        # box_i = make_pad_box_at_patch_with_yaw(pi, pad_w, pad_h, pad_d,  yaw_deg)
+        # box_j = make_pad_box_at_patch_with_yaw(pj, pad_w, pad_h, pad_d, -yaw_deg)
+
+        # legendgroup 묶기
+        lg = f"pair {idx}"
+        # ci = np.asarray(pi["centroid"], float); cj = np.asarray(pj["centroid"], float)
         traces.append(go.Scatter3d(
             x=[ci[0]], y=[ci[1]], z=[ci[2]],
             mode="markers", marker=dict(size=1, opacity=0.0),
@@ -373,12 +546,18 @@ def visualize_feasible_pairs_pads(result, reports,
                                 color=col, opacity=0.2,
                                 name=f"{lg} - pad_j", legendgroup=lg, showlegend=False))
 
+        # gripper frame (build_gripper_pose_obj 함수 사용)
+        H_grip, stroke = build_gripper_pose_obj({"centroid": ci, "normal": ni}, {"centroid": cj, "normal": nj}, yaw_deg)
+        # H_grip, stroke = build_gripper_pose_obj(pi, pj, yaw_deg)
+
+        traces += frame_traces(H_grip, lg, scale=15.0, legendgroup=lg, showlegend=False)
+
     fig = go.Figure(traces)
     fig.update_layout(
-        title=f"Feasible Pairs — Pads only (count={len(ok_idx)})",
+        title=f"Feasible Pairs — Pads + Gripper Frames (count={len(ok_idx)})",
         margin=dict(l=0,r=0,t=48,b=0),
         showlegend=True,
-        legend=dict(groupclick="togglegroup"),  # ← 그룹 단위 토글
+        legend=dict(groupclick="togglegroup"),
         scene=dict(
             xaxis=dict(range=[cx-max_range, cx+max_range], showgrid=False, zeroline=False),
             yaxis=dict(range=[cy-max_range, cy+max_range], showgrid=False, zeroline=False),
@@ -387,6 +566,116 @@ def visualize_feasible_pairs_pads(result, reports,
         )
     )
     if show:
-        fig.show()
+        fig.show(renderer="browser")
 
+    return fig
+
+
+# -------------------------------
+# 기타 임시 함수
+# -------------------------------
+def visualize_mesh_with_edges(mesh, color="#166534", edge_color="#166534", opacity=0.5,
+                              edge_width=4, show=True):
+    """
+    주어진 trimesh.Trimesh를 단순히 시각화.
+    - mesh: trimesh.Trimesh
+    - color: 표면 색
+    - edge_color: 경계선 색
+    - opacity: 표면 투명도
+    - edge_width: 경계선 두께
+    """
+    # bounding box로 범위 계산
+    (xmin, ymin, zmin), (xmax, ymax, zmax) = mesh.bounds
+    cx, cy, cz = (xmax+xmin)/2, (ymax+ymin)/2, (zmax+zmin)/2
+    max_range  = max(xmax-xmin, ymax-ymin, zmax-zmin)
+
+    traces = []
+
+    # 표면 (Mesh3d)
+    x, y, z = mesh.vertices.T
+    I, J, K = mesh.faces.T
+    traces.append(go.Mesh3d(
+        x=x, y=y, z=z,
+        i=I, j=J, k=K,
+        color=color, opacity=opacity,
+        name="mesh"
+    ))
+
+    # edge (Wireframe)
+    edges = mesh.edges_unique
+    verts = mesh.vertices
+    xe, ye, ze = [], [], []
+    for (v0, v1) in edges:
+        xe += [verts[v0][0], verts[v1][0], None]
+        ye += [verts[v0][1], verts[v1][1], None]
+        ze += [verts[v0][2], verts[v1][2], None]
+    traces.append(go.Scatter3d(
+        x=xe, y=ye, z=ze,
+        mode="lines",
+        line=dict(color=edge_color, width=edge_width),
+        name="edges"
+    ))
+
+    # figure
+    fig = go.Figure(traces)
+    fig.update_layout(
+        title="Mesh with Edges",
+        margin=dict(l=0, r=0, t=40, b=0),
+        showlegend=True,
+        scene=dict(
+            xaxis=dict(range=[cx-max_range, cx+max_range], showgrid=False, zeroline=False),
+            yaxis=dict(range=[cy-max_range, cy+max_range], showgrid=False, zeroline=False),
+            zaxis=dict(range=[cz-max_range, cz+max_range], showgrid=False, zeroline=False),
+            aspectmode="cube"
+        )
+    )
+    if show:
+        fig.show(renderer="browser")
+
+    return fig
+
+
+def visualize_frames(H_dict, scale=30.0, show=True, H_OdEn = None, result = None, save = False, save_path = None):
+    """
+    여러 좌표계 프레임을 시각화
+    H_dict: {이름: 4x4 행렬}
+    H_OdEn: 엔드이펙터 기준 오브젝트 HM
+
+    """
+    traces = []
+
+    mesh_sil = result["mesh_quad"]
+    # H_OdEn 으로 mesh 회전 후 fig에 추가
+    mesh_tf = mesh_sil.copy()
+    mesh_tf.apply_transform(H_OdEn)
+    x, y, z = mesh_tf.vertices.T
+    i, j, k = mesh_tf.faces.T
+    traces.append(go.Mesh3d(
+        x=x, y=y, z=z,
+        i=i, j=j, k=k,
+        color="#cfcfcf", opacity=0.3,
+        name="object_mesh", legendgroup="object_mesh", showlegend=True
+    ))
+
+    for i, (name, H) in enumerate(H_dict.items()):
+        traces += frame_traces(H, name, scale=scale, legendgroup=name, showlegend=True)
+
+    fig = go.Figure(traces)
+    fig.update_layout(
+        title="Coordinate Frames Visualization",
+        margin=dict(l=0,r=0,t=30,b=0),
+        showlegend=True,
+        legend=dict(groupclick="togglegroup"),  # 그룹 단위 토글
+        scene=dict(
+            xaxis=dict(showgrid=True, zeroline=True, range=[-1000, 1000]),
+            yaxis=dict(showgrid=True, zeroline=True, range=[-1000, 1000]),
+            zaxis=dict(showgrid=True, zeroline=True, range=[-1000, 1000]),
+            aspectmode="cube"
+        )
+    )
+    if show:
+        fig.show(renderer="browser")
+
+    if save:
+        fig.write_html(save_path)
     return fig
