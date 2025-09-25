@@ -24,9 +24,9 @@ class PatchPairParams:
     max_opening: float = 140.0
     angle_tolerance_deg: float = 15.0
     # parallel_weight: float = 0.2 # TODO: 추후 다른 기준 추가 시 조정
-    overlap_weight:   float = 1 # TODO: 추후 다른 기준 추가 시 조정
+    # overlap_weight:   float = 1 # TODO: 추후 다른 기준 추가 시 조정
     distance_weight:  float = 1 # TODO: 추후 다른 기준 추가 시 조정
-    inertia_weight:   float = 1 # TODO: 추후 다른 기준 추가 시 조정
+    # inertia_weight:   float = 1 # TODO: 추후 다른 기준 추가 시 조정
     samples_per_face= 3          # face 샘플링 개수
 
 
@@ -328,7 +328,7 @@ def extract_planar_patches(
     face_adjacency = mesh.face_adjacency
     F = len(faces)
 
-    min_patch_area = mesh.area * 0.0001 
+    min_patch_area = mesh.area * 0.001 
     # max_patch_area = mesh.area * 0.0001
 
     neighbors = [[] for _ in range(F)]
@@ -475,14 +475,15 @@ def score_patch_pair(patch_a: PlanarPatch,
     dist_b = point_line_distance(c_b, n_b, c_a)
     s_distance = 1 - (dist_a + dist_b) / bbox_diag
 
-    # TODO: 회전 관성 점수: ca-cb 직선과 mesh COM 간 거리 점수
-    com_mesh = mesh_for_overlap.center_mass
-    direction = (c_a - c_b) / width
-    dist_inertia = point_line_distance(c_b, direction, com_mesh)
-    s_inertia = 1 - dist_inertia / bbox_diag
+    # # TODO: 회전 관성 점수: ca-cb 직선과 mesh COM 간 거리 점수
+    # com_mesh = mesh_for_overlap.center_mass
+    # direction = (c_a - c_b) / width
+    # dist_inertia = point_line_distance(c_b, direction, com_mesh)
+    # s_inertia = 1 - dist_inertia / bbox_diag
 
     # 최종 점수(가중합)
-    score = params.distance_weight * s_distance + params.overlap_weight * s_overlap + params.inertia_weight * s_inertia
+    score = params.distance_weight * s_distance
+    #  + params.overlap_weight * s_overlap + params.inertia_weight * s_inertia
 
     return PatchPairCandidate(
         patch_i=patch_a.id,
@@ -493,7 +494,7 @@ def score_patch_pair(patch_a: PlanarPatch,
         terms={
             "overlap": s_overlap,
             "distance": s_distance,
-            "inertia": s_inertia
+            # "inertia": s_inertia
               },
     )
 
@@ -501,7 +502,6 @@ def score_patch_pair(patch_a: PlanarPatch,
 # --------------------------
 # Main API
 # --------------------------
-
 def compute_best_patch_pairs(
     mesh_path: str,
     mesh_max_triangles: int = 500,         # 원본 mesh 삼각형 개수
@@ -668,15 +668,16 @@ def check_gripper_feasibility_faces_with_yaw(
         n_j = unit(np.asarray(p_j["normal"], float))
 
         best_overall = None  # 이 pair에서 모멘트가 가장 작은 (f_i, f_j) 1개
+        mesh_F, mesh_V = mesh.faces, mesh.vertices
         for f_i in p_i["face_indices"]:
-            ci = mesh.vertices[mesh.faces[f_i]].mean(axis=0)
+            ci = mesh_V[mesh_F[f_i]].mean(axis=0)
 
             # f_i에 대해 "가장 평행"한 f_j 하나만 선택 (dot 기반 점수)
             best_j   = None
             best_cj  = None
             best_scr = -1.0
             for f_j in p_j["face_indices"]:
-                cj = mesh.vertices[mesh.faces[f_j]].mean(axis=0)
+                cj = mesh_V[mesh_F[f_j]].mean(axis=0)
                 d  = cj - ci
                 nd = np.linalg.norm(d)
                 if nd < 1e-12:  # 동일점 방지
