@@ -635,6 +635,150 @@ def visualize_mesh_with_edges(mesh, color="#166534", edge_color="#166534", opaci
     return fig
 
 
+def visualize_report_faces(result, report, 
+                           show_silhouette=True, show=True):
+    """
+    단일 report에 대한 face 시각화
+    - mesh_quad: 반투명 회색
+    - patch i, j 의 모든 face: 단일 색상
+    - face_i, face_j: 강조 색상
+    """
+    mesh_sil = result["mesh_quad"]
+    mesh_p   = result["mesh_patches"]
+    patches  = {p["id"]: p for p in result["patches"]}
+
+    pid_i, pid_j = report["patch_i"], report["patch_j"]
+    fi_sel, fj_sel = int(report["face_i"]), int(report["face_j"])
+
+    pi, pj = patches[pid_i], patches[pid_j]
+
+    (xmin, ymin, zmin), (xmax, ymax, zmax) = mesh_sil.bounds
+    cx, cy, cz   = (xmax+xmin)/2, (ymax+ymin)/2, (zmax+zmin)/2
+    max_range    = max(xmax-xmin, ymax-ymin, zmax-zmin)
+
+    traces = []
+    if show_silhouette:
+        traces.append(mesh3d_from_trimesh(mesh_sil, None,
+                                          color="#cfcfcf", opacity=0.15,
+                                          name="silhouette"))
+
+    # Patch i (연두색)
+    fidx_i = set(pi["face_indices"])
+    traces.append(mesh3d_from_trimesh(mesh_p, fidx_i, color="#99ff99", opacity=0.5,
+                                      name=f"patch {pid_i} faces"))
+    edge_i = boundary_edges_trace(mesh_p, fidx_i, color="#008800", width=2,
+                                  name=f"patch {pid_i} edges")
+    if edge_i is not None:
+        traces.append(edge_i)
+
+    # Patch j (하늘색)
+    fidx_j = set(pj["face_indices"])
+    traces.append(mesh3d_from_trimesh(mesh_p, fidx_j, color="#99ccff", opacity=0.5,
+                                      name=f"patch {pid_j} faces"))
+    edge_j = boundary_edges_trace(mesh_p, fidx_j, color="#004488", width=2,
+                                  name=f"patch {pid_j} edges")
+    if edge_j is not None:
+        traces.append(edge_j)
+
+    # 강조 face_i (빨강)
+    traces.append(mesh3d_from_trimesh(mesh_p, {fi_sel}, color="#ff0000", opacity=1.0,
+                                      name=f"face {fi_sel} (patch {pid_i})"))
+
+    # 강조 face_j (파랑)
+    traces.append(mesh3d_from_trimesh(mesh_p, {fj_sel}, color="#0000ff", opacity=1.0,
+                                      name=f"face {fj_sel} (patch {pid_j})"))
+
+    fig = go.Figure(traces)
+    fig.update_layout(
+        title=f"Report pair {report['pair_index']} (patch {pid_i}, {pid_j})",
+        margin=dict(l=0,r=0,t=48,b=0),
+        showlegend=True,
+        scene=dict(
+            xaxis=dict(range=[cx-max_range, cx+max_range], showgrid=False, zeroline=False),
+            yaxis=dict(range=[cy-max_range, cy+max_range], showgrid=False, zeroline=False),
+            zaxis=dict(range=[cz-max_range, cz+max_range], showgrid=False, zeroline=False),
+            aspectmode="cube"
+        )
+    )
+    if show:
+        fig.show(renderer="browser")
+    return fig
+
+
+def visualize_patch_pair_faces(result, report, show=True):
+    """
+    result: grasping.compute_best_patch_pairs(...) 출력 dict
+    report: reports[k] (단일 pair)
+    
+    patch_i, patch_j 에 포함된 모든 face를 각각 따로 토글 가능하도록 시각화
+    """
+    mesh_sil = result["mesh_quad"]
+    mesh_p = result["mesh_patches"]
+    patches = {p["id"]: p for p in result["patches"]}
+    
+    pid_i, pid_j = report["patch_i"], report["patch_j"]
+    pi, pj = patches[pid_i], patches[pid_j]
+
+    verts = np.asarray(mesh_p.vertices)
+    faces = np.asarray(mesh_p.faces)
+
+    (xmin, ymin, zmin), (xmax, ymax, zmax) = mesh_p.bounds
+    cx, cy, cz = (xmax+xmin)/2, (ymax+ymin)/2, (zmax+zmin)/2
+    max_range  = max(xmax-xmin, ymax-ymin, zmax-zmin)
+
+    traces = []
+
+    traces.append(mesh3d_from_trimesh(mesh_sil, None,
+                                        color="#cfcfcf", opacity=0.15,
+                                        name="silhouette"))
+
+    # patch i faces (빨강 계열)
+    for fidx in pi["face_indices"]:
+        tri = faces[fidx]
+        x,y,z = verts[tri].T
+        traces.append(go.Mesh3d(
+            x=x, y=y, z=z,
+            i=[0], j=[1], k=[2],
+            color="red",
+            opacity=0.6,
+            name=f"patch {pid_i} face {fidx}",
+            legendgroup=f"patch {pid_i} face {fidx}",
+            showlegend=True
+        ))
+
+    # patch j faces (파랑 계열)
+    for fidx in pj["face_indices"]:
+        tri = faces[fidx]
+        x,y,z = verts[tri].T
+        traces.append(go.Mesh3d(
+            x=x, y=y, z=z,
+            i=[0], j=[1], k=[2],
+            color="blue",
+            opacity=0.6,
+            name=f"patch {pid_j} face {fidx}",
+            legendgroup=f"patch {pid_j} face {fidx}",
+            showlegend=True
+        ))
+
+    fig = go.Figure(traces)
+    fig.update_layout(
+        title=f"Patch pair {pid_i} & {pid_j} (faces)",
+        margin=dict(l=0,r=0,t=48,b=0),
+        showlegend=True,
+        legend=dict(groupclick="togglegroup"),  # 그룹 단위 토글
+        scene=dict(
+            xaxis=dict(range=[cx-max_range, cx+max_range], showgrid=False, zeroline=False),
+            yaxis=dict(range=[cy-max_range, cy+max_range], showgrid=False, zeroline=False),
+            zaxis=dict(range=[cz-max_range, cz+max_range], showgrid=False, zeroline=False),
+            aspectmode="cube"
+        )
+    )
+    if show:
+        fig.show(renderer="browser")
+
+    return fig
+
+
 def visualize_frames(H_dict, scale=30.0, show=True, H_OdEn = None, result = None, save = False, save_path = None):
     """
     여러 좌표계 프레임을 시각화
