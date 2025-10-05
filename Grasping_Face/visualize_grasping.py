@@ -412,7 +412,7 @@ def visualize_feasible_pairs_pads(result, reports,
 
     traces=[]
     if show_silhouette:
-        traces.append(mesh3d_from_trimesh(mesh, color="#cfcfcf", opacity=0.8, name="mesh"))
+        traces.append(mesh3d_from_trimesh(mesh, color="#cfcfcf", opacity=0.5, name="mesh"))
 
     for k, idx in enumerate(ok_idx):
         if idx >= len(pairs): continue
