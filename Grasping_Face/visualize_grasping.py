@@ -236,7 +236,7 @@ def build_gripper_pose_obj(p_i, p_j, yaw_deg=0.0):
         # R_world = np.linalg.inv(R_world)
         z_axis = - z_axis  # pad w 방향
         y_axis = - y_axis  # pad h 방향
-        x_axis = - x_axis  # closing 방향
+        x_axis = np.cross(y_axis, z_axis)  # closing 방향
 
     # 직교 보정 (x,y,z 순서)
     R = np.column_stack([x_axis, y_axis, z_axis])

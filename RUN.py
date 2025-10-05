@@ -51,9 +51,6 @@ from Pose_Estimation_Model.utils.draw_utils import draw_detections
 import pycocotools.mask as cocomask
 import trimesh
 
-import Grasping_Face.grasping as gf
-import Grasping_Face.visualize_grasping as gfv
-
 rgb_transform = transforms.Compose([transforms.ToTensor(),
                                     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                                          std=[0.229, 0.224, 0.225])])
@@ -66,24 +63,26 @@ def load_json(path):
 # torch.cuda.empty_cache()
 
 ############### Settings ###############
-SCENE_DATE = time.strftime("%Y%m%d_%H%M%S")
-SCENE_ID  = '0'
-object_id = 'logitech_c930e_m'   # 'logitech_c930e_m'
-
 # OPE model settings
 segmentor_model  = 'fastsam' # 'sam' , 'fastsam'
+
+object_id = 'logitech_c930e_m'   # 'logitech_c930e_m'
+scene_date = '250827'
+scene_id  = '0'
 
 template_dir = f'./models_target/templates/{object_id}' 
 cad_path     = f'./models_target/models_cad/{object_id}.obj'
 output_dir   =  './RUN_result/output'
-cam_path     = f'./RUN_result/test_rgbd/{time.strftime("%Y%m%d")}/scene_camera.json'
-seg_path     = f'{output_dir}/detection_ism_{SCENE_DATE}_{SCENE_ID}_{object_id}.json'
+cam_path     = f'./RUN_result/test_rgbd/{scene_date}/scene_camera.json'
+rgb_path     = f'./RUN_result/test_rgbd/{scene_date}/rgb/{scene_id.zfill(6)}.png'
+depth_path   = f'./RUN_result/test_rgbd/{scene_date}/depth/{scene_id.zfill(6)}.png'
+seg_path     = f'{output_dir}/detection_ism_{scene_date}_{scene_id}_{object_id}.json'
 stability_score_thresh = 0.97
 det_score_thresh = 0.2
 gpus = 0
 
 # # communication settings
-# comm = False # whether to make server on this computer
+# COMM = False # whether to make server on this computer
 # HOST = '192.168.0.30'
 # PORT = 9900
 
@@ -167,8 +166,9 @@ def ISM_visualize_all(rgb, detections, save_path="tmp.png"):
     concat.paste(prediction, (rgb.size[0], 0))
     return concat
 
-def ISM_batch_input_data(depth_path = '', cam_path = cam_path, device = device, scene_id = SCENE_ID):
+def ISM_batch_input_data(depth_path = depth_path, cam_path = cam_path, device = device, scene_id = scene_id):
     batch = {}
+    # cam_info = load_json(cam_path)
     cam_info = load_json(cam_path)[scene_id]
     depth = np.array(imageio.imread(depth_path)).astype(np.int32)
     cam_K = np.array(cam_info['cam_K']).reshape((3, 3))
@@ -249,7 +249,7 @@ def ISM_load(segmentor_model = segmentor_model, output_dir = output_dir, templat
 
     return model
 
-def ISM_run_save(ISMmodel = None, cad_path = cad_path, rgb_path = '', depth_path = '', cam_path = cam_path, save_img = True, tag='default'):
+def ISM_run_save(ISMmodel = None, cad_path = cad_path, rgb_path = rgb_path, depth_path = depth_path, cam_path = cam_path, save_img = True):
     # run inference
     rgb = Image.open(rgb_path).convert("RGB")
     detections = ISMmodel.segmentor_model.generate_masks(np.array(rgb))
@@ -272,7 +272,7 @@ def ISM_run_save(ISMmodel = None, cad_path = cad_path, rgb_path = '', depth_path
     appe_scores, ref_aux_descriptor= ISMmodel.compute_appearance_score(best_template, pred_idx_objects, query_appe_descriptors)
 
     # compute the geometric score
-    batch = ISM_batch_input_data(depth_path, cam_path, device, SCENE_ID)
+    batch = ISM_batch_input_data(depth_path, cam_path, device, scene_id)
     template_poses = get_obj_poses_from_template_level(level=2, pose_distribution="all")
     template_poses[:, :3, 3] *= 0.4
     poses = torch.tensor(template_poses).to(torch.float32).to(device)
@@ -296,14 +296,14 @@ def ISM_run_save(ISMmodel = None, cad_path = cad_path, rgb_path = '', depth_path
 
     # save ISM result
     detections.to_numpy()
-    save_path = f"{output_dir}/detection_ism_{tag}_{object_id}"
+    save_path = f"{output_dir}/detection_ism_{scene_date}_{scene_id}_{object_id}"
     detections.save_to_file(0, 0, 0, save_path, "Custom", return_results=False)
     detections = convert_npz_to_json(idx=0, list_npz_paths=[save_path+".npz"])
     save_json_bop23(save_path+".json", detections)
 
     if save_img:
-        vis_img = ISM_visualize_all(rgb, detections, f"{output_dir}/vis_ism_{tag}_{object_id}.png")
-        vis_img.save(f"{output_dir}/vis_ism_{tag}_{object_id}.png")
+        vis_img = ISM_visualize_all(rgb, detections, f"{output_dir}/vis_ism_{scene_date}_{scene_id}_{object_id}.png")
+        vis_img.save(f"{output_dir}/vis_ism_{scene_date}_{scene_id}_{object_id}.png")
 
     torch.cuda.empty_cache()
 
@@ -370,10 +370,10 @@ def get_templates(path, cfg):
         all_tem_pts.append(torch.FloatTensor(tem_pts).unsqueeze(0).cuda())
     return all_tem, all_tem_pts, all_tem_choose
 
-def get_test_data(rgb_path = '', depth_path = '', cam_path = cam_path, cad_path = cad_path, seg_path = seg_path, det_score_thresh = det_score_thresh, cfg = None, scene_id = SCENE_ID, N_INSTANCE = 15): # RTX 5070 laptop GPU 메모리 기준: N_INSTANCE=30
+def get_test_data(rgb_path = rgb_path, depth_path = depth_path, cam_path = cam_path, cad_path = cad_path, seg_path = seg_path, det_score_thresh = det_score_thresh, cfg = None, scene_id = scene_id, N_INSTANCE = 30): # RTX 5070 laptop GPU 메모리 기준: N_INSTANCE=30
     dets = []
     with open(seg_path) as f:
-        dets_ = json.load(f) # keys: SCENE_ID, image_id, category_id, bbox, score, segmentation
+        dets_ = json.load(f) # keys: scene_id, image_id, category_id, bbox, score, segmentation
     for det in dets_:
         if det['score'] > det_score_thresh:
             dets.append(det)
@@ -476,7 +476,7 @@ def get_test_data(rgb_path = '', depth_path = '', cam_path = cam_path, cad_path 
 
     return ret_dict, whole_image, whole_pts.reshape(-1, 3), model_points, all_dets
 
-def PEM_init(gpus = gpus, output_dir = output_dir, template_dir = template_dir, cad_path = cad_path, rgb_path = '', depth_path = '', cam_path = cam_path, seg_path = seg_path, det_score_thresh = det_score_thresh):
+def PEM_init(gpus = gpus, output_dir = output_dir, template_dir = template_dir, cad_path = cad_path, rgb_path = rgb_path, depth_path = depth_path, cam_path = cam_path, seg_path = seg_path, det_score_thresh = det_score_thresh):
     # exp_name = model_name + '_' + \
     #     osp.splitext(config.split("/")[-1])[0] + '_id' + str(exp_id)
     # log_dir = osp.join("log", exp_name)
@@ -518,7 +518,7 @@ def PEM_load(cfg = None):
 
     return model
 
-def PEM_run_save(model = None, cfg = None, save_img = True, tag='default'):
+def PEM_run_save(model = None, cfg = None, save_img = True):
     print("=> extracting templates for PEM ...")
     tem_path = cfg.template_dir
     all_tem, all_tem_pts, all_tem_choose = get_templates(tem_path, cfg.test_dataset)
@@ -528,7 +528,7 @@ def PEM_run_save(model = None, cfg = None, save_img = True, tag='default'):
     print("=> loading input data for PEM ...")
     input_data, img, whole_pts, model_points, detections = get_test_data(
         cfg.rgb_path, cfg.depth_path, cfg.cam_path, cfg.cad_path, cfg.seg_path, 
-        cfg.det_score_thresh, cfg.test_dataset, SCENE_ID
+        cfg.det_score_thresh, cfg.test_dataset, scene_id
     )
     ninstance = input_data['pts'].size(0)
     
@@ -550,11 +550,12 @@ def PEM_run_save(model = None, cfg = None, save_img = True, tag='default'):
     pred_rot = out['pred_R'].detach().cpu().numpy()
     pred_trans = out['pred_t'].detach().cpu().numpy() * 1000
 
-    # get Cam to Object Homogeneous Matrix with best score
+    # get quaternion with best score
     best_idx = pose_scores.argmax()
     R_best = pred_rot[best_idx]      # shape: (3,3) 또는 (9,) or (4,4) 일 수 있음 (아래 참고)
+    quat_best = Rotation.from_matrix(R_best).as_quat()   # [x, y, z, w] (scipy의 기본 순서)
     t_best = pred_trans[best_idx]    # shape: (3,)
-    H_OC_best = gf.to44(R_best, t_best) # Cam 시점 Object 위치 HM
+    out_best = np.concatenate([t_best, quat_best])
 
     print("=> saving PEM results ...")
     os.makedirs(f"{cfg.output_dir}", exist_ok=True)
@@ -563,11 +564,11 @@ def PEM_run_save(model = None, cfg = None, save_img = True, tag='default'):
         detections[idx]['R'] = list(pred_rot[idx].tolist())
         detections[idx]['t'] = list(pred_trans[idx].tolist())
 
-    with open(os.path.join(cfg.output_dir, f'detection_pem_{tag}_{object_id}.json'), "w") as f:
+    with open(os.path.join(f"{cfg.output_dir}", f'detection_pem_{scene_date}_{scene_id}_{object_id}.json'), "w") as f:
         json.dump(detections, f)
 
     print("=> visualizating PEM ...")
-    save_path = os.path.join(f"{cfg.output_dir}", f'vis_pem_{tag}_{object_id}.png')
+    save_path = os.path.join(f"{cfg.output_dir}", f'vis_pem_{scene_date}_{scene_id}_{object_id}.png')
     valid_masks = pose_scores == pose_scores.max()
     # valid_masks = pose_scores >= pose_scores.min()
     # valid_masks = pose_scores > 0.01
@@ -579,68 +580,7 @@ def PEM_run_save(model = None, cfg = None, save_img = True, tag='default'):
 
     torch.cuda.empty_cache()
 
-    return H_OC_best
-
-# ---- Grasping Alg. + EE pose calculation ----
-def get_object_grasping(target_mesh_file = cad_path, top_pairs = 10,
-                        H_OC = None, show = True, save = True, save_path = None):
-    """
-    top_pairs: pair 개수
-    H_OC: Cam 기준 Object 위치 HM
-    """
-    result = gf.compute_best_patch_pairs(
-        mesh_path=target_mesh_file,
-        mesh_max_triangles = 1000,
-        angle_deg=30,              # 패치 병합 허용 각도 (↑면 패치 수 ↓)
-        coplanar_tol=1,            # 공면성 허용 오차 (↑면 패치 수 ↓)
-        min_opening=5.0,          # 그리퍼 최소 개구(mm)
-        max_opening=140.0,         # 그리퍼 최대 개구(mm)
-        angle_tolerance_deg=15,    # 패치 페어 정반대 threshold
-        top_k=100                  # 상위 패치 페어 후보 개수
-    )
-    # reports = gf.check_gripper_feasibility_with_yaw(result)
-    reports = gf.check_gripper_feasibility_faces_with_yaw(result)
-    feasible_r = [r for r in reports if r.get('feasible')]
-    print(f'[GRP] feasible gripping sol.: {len(feasible_r)}')
-
-    mesh_patches = result['mesh_patches']
-
-    feasible_pairs = []
-    H_dict = {"EE origin": np.eye(4,4)} # EE 좌표계 원점 
-    for k in range(min(top_pairs, len(feasible_r))):
-        report = reports[k]
-        pi = result['patches'][report['patch_i']]
-        pj = result['patches'][report['patch_j']]
-        ni = gf.unit(np.asarray(pi["normal"], float))
-        nj = gf.unit(np.asarray(pj["normal"], float))
-        fi = report['face_i']
-        fj = report['face_j']
-        ci = mesh_patches.vertices[mesh_patches.faces[fi]].mean(axis=0)
-        cj = mesh_patches.vertices[mesh_patches.faces[fj]].mean(axis=0)
-        yaw_deg = report['feasible_yaw']
-
-        H_OG, stroke = gf.build_gripper_pose_obj_OPE({"centroid": ci, "normal": ni}, {"centroid": cj, "normal": nj}, yaw_deg, H_OC=H_OC)
-        H_EdEn, H_OdEn = gf.ee_delta_pose_des(H_OC, H_OG)
-        
-        r_quat = Rotation.from_matrix(H_EdEn[:3,:3]).as_quat()
-
-        z_H_EdEn = H_EdEn[:3,2] # z축 각도 필터링용
-        if np.dot(z_H_EdEn, np.array([0,0,1])) < 0.5: # 각도 60 이하인 경우만
-            continue
-
-        t_quat = H_EdEn[:3,3] / 1000
-        res = {"pose_quat": np.concatenate([t_quat, r_quat]),
-               "stroke": stroke}
-        feasible_pairs.append(res)
-
-        if show:
-            H_dict[f"pair {k+1}"] = H_EdEn
-
-    if show:
-        gfv.visualize_frames(H_dict, scale=100, H_OdEn=H_OdEn, result=result, save=save, save_path=save_path)
-
-    return feasible_pairs
-
+    return out_best
 
 # ---- Realtime RGBD camera stream func. (Intel Realsense) ----
 def RT_get_realsense_stream():
@@ -664,13 +604,12 @@ def RT_get_realsense_stream():
         [0, 0, 1]
     ]
     scene_camera_info = {}
-    scene_camera_info[SCENE_ID] = {
+    scene_camera_info[scene_id] = {
         "cam_K": [v for row in cam_K for v in row],
         "depth_scale": depth_scale * 1000.0,  # mm 단위
         "view_level": 0
     }
-    # dir_path = f'./RUN_result/test_rgbd/{}'
-    dir_path = f'./RUN_result/test_rgbd/{time.strftime("%Y%m%d")}'
+    dir_path = f'./RUN_result/test_rgbd/{scene_date}'
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
     with open(cam_path, "w") as f:
@@ -689,36 +628,8 @@ def RT_get_one_rgbd_frame(pipeline, align):
     depth_image = np.asanyarray(depth_frame.get_data())
     return color_image, depth_image
 
-
-# ---- COMM func ----
-def send_command(IP, PORT, res):
-    # 데이터 문자열
-    dx, dy, dz, dqx, dqy, dqz, dqw = res['pose_quat']
-    stroke = res['stroke']
-    message = f"{dx},{dy},{dz},{dqx},{dqy},{dqz},{dqw},{stroke}"
-    
-    print(f"Connecting to {IP}:{PORT}...")
-    
-    try:
-        # TCP 소켓 생성 및 서버에 연결
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((IP, PORT))
-            
-            # 메시지를 UTF-8 바이트로 인코딩하여 전송
-            s.sendall(message.encode('utf-8'))
-            
-            print(f"Successfully sent command: {message}")
-            
-    except ConnectionRefusedError:
-        print(f"Error: Connection refused. ROS PC에서 arm_gripper_coordinator 노드가 실행 중인지 확인하세요.")
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-
 # ---- Main loop  ----
-def RT_inference(comm = False, IP = '', PORT = ''):
-    global SCENE_ID
-    global SCENE_DATE
-
+def RT_inference(comm = False, HOST = '', PORT = ''):
     # 1. 모델 미리 로드 (권장: 느려도 최초 1회만!)
     model_ism = ISM_load()
     cfg = PEM_init()
@@ -752,8 +663,7 @@ def RT_inference(comm = False, IP = '', PORT = ''):
                 ISMmodel = model_ism, 
                 rgb_path = rgb_save_path, 
                 depth_path = depth_save_path,
-                save_img = True, 
-                tag = now_str
+                save_img = True
             )
             print("[Realtime] ISM done!")
 
@@ -762,29 +672,35 @@ def RT_inference(comm = False, IP = '', PORT = ''):
             # config에서 해당 프레임 경로로 세팅 (필요시)
             cfg.rgb_path = rgb_save_path
             cfg.depth_path = depth_save_path
-            cfg.seg_path = f"{output_dir}/detection_ism_{now_str}_{object_id}.json"  # ISM 저장 경로
-            H_OC_best = PEM_run_save(model = model_pem,
-                                     cfg = cfg,
-                                     save_img = True,
-                                     tag = now_str) # best HM
+            cfg.seg_path = f"{output_dir}/detection_ism_{scene_date}_{scene_id}_{object_id}.json"  # ISM 저장 경로
+            pem_result = PEM_run_save(model = model_pem, cfg = cfg, save_img = True) # best quaternion
             print("[Realtime] PEM done!")
 
-            # 4. 그리핑 결과 전송 
-            gsolpath = f"{output_dir}/vis_grasping_sol_{now_str}_{object_id}.html"
-            grip_result = get_object_grasping(H_OC=H_OC_best, save_path = gsolpath)
-            # for grip_res in grip_result:
-            #     print(grip_res)
-            grip_res = grip_result[0] # 첫번째 후보
+            # 4. 결과 전송
             if comm == True:
-                send_command(IP, PORT, grip_res)
+                # encode pose data 
+                data_send = pem_result.tolist()
+                msg_send  = json.dumps({'pose': data_send}).encode()
+                # open server 
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.bind((HOST, PORT))
+                sock.listen(1)
+                print(f"Waiting for ROS-PC connection on {HOST}:{PORT} ...")
+                conn, addr = sock.accept()
+                print(f"Connected by {addr}")
+
+                data = conn.recv(4096)
+                if data:
+                    conn.sendall(msg_send)
+                conn.close()
 
             # +. 결과 이미지 표시 
-            # ism_vis_path = f"{output_dir}/vis_ism_{now_str}_{object_id}.png"
-            # if os.path.exists(ism_vis_path):
-            #     ism_vis_img = cv2.imread(ism_vis_path)
-            #     cv2.imshow("ISM Result", ism_vis_img)
-            #     cv2.waitKey(1)
-            pem_vis_path = f"{output_dir}/vis_pem_{now_str}_{object_id}.png"
+            ism_vis_path = f"{output_dir}/vis_ism_{scene_date}_{scene_id}_{object_id}.png"
+            if os.path.exists(ism_vis_path):
+                ism_vis_img = cv2.imread(ism_vis_path)
+                cv2.imshow("ISM Result", ism_vis_img)
+                cv2.waitKey(1)
+            pem_vis_path = f"{output_dir}/vis_pem_{scene_date}_{scene_id}_{object_id}.png"
             if os.path.exists(pem_vis_path):
                 pem_vis_img = cv2.imread(pem_vis_path)
                 cv2.imshow("PEM Result", pem_vis_img)
@@ -796,6 +712,14 @@ def RT_inference(comm = False, IP = '', PORT = ''):
     pipeline.stop()
     cv2.destroyAllWindows()
 
+################################# Sequence (single time, reference from files) #################################
+# model_ism = ISM_load()
+# ISM_detections = ISM_run_save(ISMmodel = model_ism)
+
+# cfg = PEM_init()
+# model_pem = PEM_load(cfg)
+# PEM_out = PEM_run_save(model_pem, cfg)
+
 ################################# Sequence (Realtime) #################################
 if __name__ == "__main__":
-    RT_inference(comm=True, IP='192.168.0.22', PORT=9900)
+    RT_inference(comm=False, HOST='192.168.0.30', PORT='9900')

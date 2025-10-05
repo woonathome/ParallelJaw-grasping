@@ -795,12 +795,58 @@ def build_gripper_pose_obj(p_i, p_j, yaw_deg=0.0):
         # R_world = np.linalg.inv(R_world)
         z_axis = - z_axis  # pad w 방향
         y_axis = - y_axis  # pad h 방향
-        x_axis = - x_axis  # closing 방향
+        x_axis = np.cross(y_axis, z_axis)  # closing 방향
 
     # 직교 보정 (x,y,z 순서)
     R = np.column_stack([x_axis, y_axis, z_axis])
 
     # 그리퍼 stroke에 따른 그리퍼 원점 업데이트 (z축 반대방향으로 stroke offset 만큼 이동)
+    stroke = np.linalg.norm(cj - ci)
+    d = origin_offset_from_stroke(stroke)
+    o = o_pad + (- z_axis * d)
+    H_OG = to44(R, o)
+
+    return H_OG, stroke
+
+def build_gripper_pose_obj_OPE(p_i, p_j, yaw_deg=0.0, H_OC=np.eye(4)):
+    """
+    객체 좌표계 상 두 패치 pair로부터 그리퍼 좌표계 pose 생성.
+    - origin: 두 centroid의 중점 (패드 중앙)
+    - x축: i -j 평균  (closing 방향) 
+    반환: (4x4 pose 행렬, stroke=패드 거리)
+    """
+    ci = np.asarray(p_i["centroid"], float)
+    cj = np.asarray(p_j["centroid"], float)
+    ni = np.asarray(p_i["normal"], float)
+    nj = np.asarray(p_j["normal"], float)
+
+    o_pad = 0.5 * (ci + cj)
+    
+    # 이 부분은 기존과 동일
+    x_axis_base = unit(ni - nj) 
+    u, v, n = basis_from_normal(x_axis_base)
+    B = np.column_stack([u, v, n])
+    Rz = Rotz(yaw_deg)
+    R_world = B @ Rz
+    z_axis =   R_world[:, 0]
+    y_axis = - R_world[:, 1]
+    x_axis =   R_world[:, 2]
+
+    # 2. 방향 결정 로직 수정
+    # OPE 결과(H_OC)를 이용해 그리퍼 z축(접근 방향)을 카메라 좌표계 기준으로 변환
+    z_axis_in_camera = H_OC[:3, :3] @ z_axis
+    
+    # 그리퍼의 접근 방향이 카메라 좌표계의 위쪽(-Y)을 향하면, 모든 축을 뒤집어 아래(+Y)를 향하도록 함
+    # (일반적인 카메라 좌표계: Z 정면, Y 아래, X 오른쪽)
+    if z_axis_in_camera[1] < 0: 
+        z_axis = - z_axis  # pad w 방향
+        y_axis = - y_axis  # pad h 방향
+        x_axis = np.cross(y_axis, z_axis)  # closing 방향
+        
+    # 직교 보정 (x,y,z 순서)
+    R = np.column_stack([x_axis, y_axis, z_axis])
+    
+    # 이하 기존과 동일
     stroke = np.linalg.norm(cj - ci)
     d = origin_offset_from_stroke(stroke)
     o = o_pad + (- z_axis * d)
@@ -817,12 +863,12 @@ def ee_delta_pose_des(H_OC: np.ndarray, H_OG: np.ndarray):
     출력:
       H_EdEn : now EE 기준 des EE 포즈 (EE 움직일 상대 좌표)
     """
-    # 좌표계 시각화
-    H_E = np.eye(4,4) # TODO: 로봇 컨트롤러 신호 받아 변환행렬 만들기
+    # # 좌표계 시각화
+    # H_E = np.eye(4,4) # TODO: 로봇 컨트롤러 신호 받아 변환행렬 만들기 (현재는 EE 좌표계 기준이라 개발 필요 X)
 
     # 고정변환
     H_GnEn = to44(Rotx(180) @ Rotz(90), [0,0,-135])   # EE -> Grip (TODO 위 반영 업뎃)
-    H_GnCn = to44(np.eye(3), [0,48,6])           # Cam -> Grip
+    H_GnCn = to44(np.eye(3), [30,55,6])           # Cam -> Grip [0,48,6]
     H_CnGn = np.linalg.inv(H_GnCn)
     H_CnEn = H_GnEn @ H_CnGn                        # EE -> Cam
     H_EG = np.linalg.inv(H_GnEn)
