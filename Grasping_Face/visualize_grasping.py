@@ -431,14 +431,9 @@ def visualize_feasible_pairs_pads(result, reports,
         cj = mesh_patches.vertices[mesh_patches.faces[fj]].mean(axis=0)
         box_i = make_pad_box_at_patch_with_yaw({"centroid": ci, "normal": ni}, pad_w, pad_h, pad_d, yaw_deg= yaw_deg)
         box_j = make_pad_box_at_patch_with_yaw({"centroid": cj, "normal": nj}, pad_w, pad_h, pad_d, yaw_deg=-yaw_deg)
-        # ci = np.asarray(pi["centroid"], float)
-        # cj = np.asarray(pj["centroid"], float)
-        # box_i = make_pad_box_at_patch_with_yaw(pi, pad_w, pad_h, pad_d,  yaw_deg)
-        # box_j = make_pad_box_at_patch_with_yaw(pj, pad_w, pad_h, pad_d, -yaw_deg)
 
         # legendgroup으로 두 pad를 하나의 토글 그룹에 묶기
-        lg = f"pair {idx}"
-        # ci = np.asarray(pi["centroid"], float); cj = np.asarray(pj["centroid"], float)
+        lg = f"pair {idx} - faces {fi, fj}"
         # proxy(범례 핸들) – 클릭 시 그룹 전체 토글
         traces.append(go.Scatter3d(
             x=[ci[0]], y=[ci[1]], z=[ci[2]],
