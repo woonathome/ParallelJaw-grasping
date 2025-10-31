@@ -370,7 +370,7 @@ def get_templates(path, cfg):
         all_tem_pts.append(torch.FloatTensor(tem_pts).unsqueeze(0).cuda())
     return all_tem, all_tem_pts, all_tem_choose
 
-def get_test_data(rgb_path = '', depth_path = '', cam_path = cam_path, cad_path = cad_path, seg_path = seg_path, det_score_thresh = det_score_thresh, cfg = None, scene_id = SCENE_ID, N_INSTANCE = 15): # RTX 5070 laptop GPU 메모리 기준: N_INSTANCE=30
+def get_test_data(rgb_path = '', depth_path = '', cam_path = cam_path, cad_path = cad_path, seg_path = seg_path, det_score_thresh = det_score_thresh, cfg = None, scene_id = SCENE_ID, N_INSTANCE = 5): # RTX 5070 laptop GPU 메모리 기준: N_INSTANCE=30
     dets = []
     with open(seg_path) as f:
         dets_ = json.load(f) # keys: SCENE_ID, image_id, category_id, bbox, score, segmentation
@@ -386,11 +386,13 @@ def get_test_data(rgb_path = '', depth_path = '', cam_path = cam_path, cad_path 
     if len(whole_image.shape)==2:
         whole_image = np.concatenate([whole_image[:,:,None], whole_image[:,:,None], whole_image[:,:,None]], axis=2)
     whole_depth = load_im(depth_path).astype(np.float32) * cam_info['depth_scale'] / 1000.0
+    print(np.max(whole_depth)) ##################
     whole_pts = get_point_cloud_from_depth(whole_depth, K)
 
     mesh = trimesh.load_mesh(cad_path)
     model_points = mesh.sample(cfg.n_sample_model_point).astype(np.float32) / 1000.0
     radius = np.max(np.linalg.norm(model_points, axis=1))
+    print(radius)
 
     all_rgb = []
     all_cloud = []
@@ -496,9 +498,9 @@ def PEM_init(gpus = gpus, output_dir = output_dir, template_dir = template_dir, 
     cfg.cam_path = cam_path
     cfg.seg_path = seg_path
 
-    cfg.n_sample_observed_point = 512  # 2048
+    cfg.n_sample_observed_point = 2048  # 2048
     cfg.n_sample_model_point = 256     # 1024
-    cfg.n_sample_template_point = 500  # 5000
+    cfg.n_sample_template_point = 256  # 5000
 
     cfg.det_score_thresh = det_score_thresh
     gorilla.utils.set_cuda_visible_devices(gpu_ids = cfg.gpus)
@@ -815,4 +817,4 @@ def RT_inference(comm = False, IP = '', PORT = ''):
 
 ################################# Sequence (Realtime) #################################
 if __name__ == "__main__":
-    RT_inference(comm=True, IP='192.168.0.22', PORT=9900)
+    RT_inference(comm=False, IP='192.168.0.22', PORT=9900)
