@@ -6,6 +6,8 @@ from typing import List, Dict, Any, Tuple
 import numpy as np
 import trimesh
 import open3d as o3d
+import itertools
+
 
 @dataclass
 class PlanarPatch:
@@ -15,17 +17,18 @@ class PlanarPatch:
     b: float
     area: float
     centroid: List[float]
+    centroid_check: List[float]
 
 
 @dataclass
 class PatchPairParams:
-    min_opening: float = 5.0
+    min_opening: float = 1.0
     max_opening: float = 140.0
     angle_tolerance_deg: float = 15.0
-    # parallel_weight: float = 0.2 # TODO: 추후 다른 기준 추가 시 조정
-    overlap_weight:   float = 1 # TODO: 추후 다른 기준 추가 시 조정
+    overlap_weight:   float = 3 # TODO: 추후 다른 기준 추가 시 조정
     distance_weight:  float = 1 # TODO: 추후 다른 기준 추가 시 조정
     inertia_weight:   float = 1 # TODO: 추후 다른 기준 추가 시 조정
+    area_weight:      float = 1 # TODO: 추후 다른 기준 추가 시 조정
     samples_per_face= 3          # face 샘플링 개수
 
 
@@ -49,7 +52,7 @@ class PadParams:
 # --------------------------
 # Mesh helpers
 # --------------------------
-def load_uniform_mesh_with_open3d(path, target_triangles=500, min_area=5): # TODO: min_area 기준 업데이트 필요
+def load_uniform_mesh_with_open3d(path, target_triangles=500, min_area=0.01): # TODO: min_area 기준 업데이트 필요
     # Trimesh로 읽고 Open3D Mesh로 변환
     mesh_true = trimesh.load(path, force='mesh')
     if isinstance(mesh_true, trimesh.Scene):
@@ -68,7 +71,6 @@ def load_uniform_mesh_with_open3d(path, target_triangles=500, min_area=5): # TOD
     v = np.asarray(o3_simpl.vertices)
     f = np.asarray(o3_simpl.triangles) 
     mesh_quad = trimesh.Trimesh(vertices=v, faces=f, process=True)
-    # print(mesh_quad.is_watertight)
 
     # 3) 삼각형 면적 직접 계산 → 작은 face 제거
     V = np.asarray(o3_simpl.vertices)
@@ -76,7 +78,9 @@ def load_uniform_mesh_with_open3d(path, target_triangles=500, min_area=5): # TOD
     v0, v1, v2 = V[F[:,0]], V[F[:,1]], V[F[:,2]]
     areas = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
 
-    mask = areas >= float(min_area)
+    # min_area = np.min(mesh_quad.facets_area) * 2
+    # mask = areas >= float(min_area)
+    mask = areas >= 0.0
     F = F[mask]
 
     # 4) Trimesh로 반환
@@ -89,8 +93,10 @@ def split_long_edges(mesh: trimesh.Trimesh, max_iter: int = 100):
     - mesh: trimesh.Trimesh
     - max_iter: 무한 루프 방지를 위한 최대 반복 횟수
     """
-    bbox_diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
-    max_len = bbox_diag * 0.3 # max_len: 허용하는 최대 edge 길이
+    # bbox_diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+    # max_len = bbox_diag * 0.3
+    # max_len = np.sqrt(PadParams.pad_h ** 2 + PadParams.pad_w ** 2) / 2
+    max_len = min(PadParams.pad_h, PadParams.pad_w) # max_len: 허용하는 최대 edge 길이
 
     V = mesh.vertices.copy()
     F = mesh.faces.copy()
@@ -308,7 +314,7 @@ def projection_overlap_ratio(mesh: trimesh.Trimesh,
     return (inside / valid) if valid > 0 else 0.0
 
 def make_pad_box_at_patch(patch, pad_w, pad_h, pad_d, clearance_out,
-                          lift_mm: float = 2.0):
+                          lift_mm: float = 3.0):
     """
     패치 평면의 바깥쪽(+n)으로 'pad_d + clearance_out' 만큼 돌출된 OBB 생성
     + centroid에서 바깥쪽으로 lift_mm 만큼 추가 이격하여 검사 (normal이 정확히 표면에 있지 않음)
@@ -332,7 +338,7 @@ def make_pad_box_at_patch(patch, pad_w, pad_h, pad_d, clearance_out,
     return box
 
 def make_rot_pad_box_at_patch(patch, pad_w, pad_h, pad_d, clearance_out,
-                              lift_mm: float = 5.0, yaw_deg: float = 0.0):
+                              lift_mm: float = 2.0, yaw_deg: float = 0.0):
     """
     패치 평면의 바깥쪽(+n)으로 'pad_d + clearance_out' 만큼 돌출된 OBB 생성
     - extents = [pad_w, pad_h, pad_d + clearance_out]
@@ -361,6 +367,40 @@ def make_rot_pad_box_at_patch(patch, pad_w, pad_h, pad_d, clearance_out,
     box.apply_transform(T)
     return box
 
+def make_pad_cylinder_at_patch(patch, pad_w, pad_h, pad_d, clearance_out,
+                               lift_mm: float = 2.0):
+    """
+    패치 중심에서 normal 방향으로 회전하는 패드+클리어런스의 swept volume을 근사하는 원기둥 메쉬를 생성
+
+    Args:
+        patch: 패치 정보 (dict or object, 'centroid', 'normal' 필요).
+        pad_w, pad_h, pad_d: 패드 크기.
+        clearance_out: 패드 바깥쪽 클리어런스.
+        lift_mm: 패치 표면에서 얼마나 띄울지.
+
+    Returns:
+        trimesh.Trimesh: 원기둥 메쉬 객체.
+    """
+    n = unit(np.asarray(patch["normal"], float))
+    c = np.asarray(patch["centroid"], float)
+
+    height = float(pad_d + clearance_out)
+    radius = 0.5 * np.sqrt(pad_w**2 + pad_h**2)
+
+    cylinder = trimesh.creation.cylinder(radius=radius, height=height, sections=16)
+
+    # 1. Z축을 normal 벡터 n으로 회전
+    transform_rot = trimesh.geometry.align_vectors([0, 0, 1], n)
+    # 2. 원기둥의 중심을 패치 중심에서 lift_mm + height/2 만큼 이동
+    center_translation = c + n * (lift_mm + 0.5 * height)
+    transform_trans = trimesh.transformations.translation_matrix(center_translation)
+    # 변환 행렬 결합 (회전 후 이동)
+    transform_matrix = transform_trans @ transform_rot
+    # 원기둥에 변환 적용
+    cylinder.apply_transform(transform_matrix)
+
+    return cylinder
+
 # --------------------------
 # Planar patch extraction
 # --------------------------
@@ -374,8 +414,9 @@ def extract_planar_patches(
     face_adjacency = mesh.face_adjacency
     F = len(faces)
 
-    min_patch_area = mesh.area * 0.001 
-    # max_patch_area = mesh.area * 0.0001
+    # min_patch_area = mesh.area * 0.001
+    min_patch_area = mesh.area * 0
+    # max_patch_area = mesh.area * 0.0005
 
     neighbors = [[] for _ in range(F)]
     for f0, f1 in face_adjacency:
@@ -426,7 +467,7 @@ def extract_planar_patches(
             continue
     
         centroid_reg = (verts_region.max(axis=0) + verts_region.min(axis=0)) / 2
-        # centroid_reg = verts_region.mean(axis=0)
+        centroid_check = verts_region.mean(axis=0) # Normal 방향 확인용
 
         patches.append(
             PlanarPatch(
@@ -436,6 +477,7 @@ def extract_planar_patches(
                 b=float(b_reg),
                 area=area_reg,
                 centroid=centroid_reg.tolist(),
+                centroid_check=centroid_check.tolist(),
             )
         )
         pid += 1
@@ -443,31 +485,55 @@ def extract_planar_patches(
     return patches
 
 
-def orient_patch_normals(mesh_quad: trimesh.Trimesh, patches):
+def orient_patch_normals(mesh_quad: trimesh.Trimesh, mesh_patches: trimesh.Trimesh, patches):
     """
     패치 법선을 mesh 기준으로 일관되게 정렬.
     mesh.contains로 실제 안/밖을 체크
     """
     # 오프셋 길이: 모델 크기 대비 아주 작게
     bbox_diag = float(np.linalg.norm(mesh_quad.bounds[1] - mesh_quad.bounds[0]))
+    mesh_F, mesh_V = mesh_patches.faces, mesh_patches.vertices
 
     for p in patches:
         n = np.asarray(p.normal if hasattr(p, "normal") else p["normal"], float)
         n = unit(n)
-        c = np.asarray(p.centroid if hasattr(p, "centroid") else p["centroid"], float)
+
+        # # plan A: Patch centroid에서 normal로 나가면서 검사
+        # stp = np.asarray(p.centroid_check if hasattr(p, "centroid_check") else p["centroid_check"], float) # 기준 변경: max - min 중앙 지점 / 무게중심
+        # eps = bbox_diag * 0.01
+        # flip = False
+        # for scale in range(1, 11):
+        #     contain1 = mesh_quad.contains([stp + eps * n])[0] # normal 방향으로 이동
+        #     contain2 = mesh_quad.contains([stp - eps * n])[0] # normal 반대로 이동
+
+        #     if contain1 != contain2: # 둘이 다를 경우
+        #         flip = contain1  # 안이면 뒤집어 바깥 향하게
+        #         break
+        #     else: # 둘이 같을 경우
+        #         eps = eps * scale # 탐색 길이 늘리기
+        # if flip:
+        #     n = -n
+        # # 반영
+        # if hasattr(p, "normal"):
+        #     p.normal = n.tolist()
+        # else:
+        #     p["normal"] = n.tolist()
+
+        # plan B: Patch 내 첫번째 Face에서 normal로 나가면서 검사
+        f = p.face_indices[0]
+        stp = mesh_V[mesh_F[f]].mean(axis=0) # 기준 변경: patch 무게중심 -> 단일 face 중심
         eps = bbox_diag * 0.01
-
         flip = False
-
         for scale in range(1, 11):
-            contain1 = mesh_quad.contains([c + eps * n])[0] # normal 방향으로 이동
-            contain2 = mesh_quad.contains([c - eps * n])[0] # normal 반대로 이동
+            contain1 = mesh_quad.contains([stp + eps * n])[0] # normal 방향으로 이동
+            contain2 = mesh_quad.contains([stp - eps * n])[0] # normal 반대로 이동
 
             if contain1 != contain2: # 둘이 다를 경우
                 flip = contain1  # 안이면 뒤집어 바깥 향하게
                 break
             else: # 둘이 같을 경우
                 eps = eps * scale # 탐색 길이 늘리기
+
         if flip:
             n = -n
         # 반영
@@ -485,7 +551,9 @@ def orient_patch_normals(mesh_quad: trimesh.Trimesh, patches):
 def score_patch_pair(patch_a: PlanarPatch,
                      patch_b: PlanarPatch,
                      params: PatchPairParams,
-                     mesh_for_overlap: trimesh.Trimesh) -> PatchPairCandidate:
+                     mesh_for_overlap: trimesh.Trimesh,
+                     com_mesh: np.ndarray,
+                     bbox_diag: np.ndarray) -> PatchPairCandidate:
     n_a = unit(np.array(patch_a.normal))
     n_b = unit(np.array(patch_b.normal))
 
@@ -515,19 +583,29 @@ def score_patch_pair(patch_a: PlanarPatch,
     width = np.linalg.norm(c_a - c_b)
 
     # TODO: c-n 최소 거리 점수: c-n 직선과 c간의 거리 점수(패치 2개의 평행성 검사 2)
-    bbox_diag = float(np.linalg.norm(mesh_for_overlap.bounds[1] - mesh_for_overlap.bounds[0]))
+    # bbox_diag = float(np.linalg.norm(mesh_for_overlap.bounds[1] - mesh_for_overlap.bounds[0]))
     dist_a = point_line_distance(c_a, n_a, c_b)
     dist_b = point_line_distance(c_b, n_b, c_a)
     s_distance = 1 - (dist_a + dist_b) / bbox_diag
 
     # TODO: 회전 관성 점수: ca-cb 직선과 mesh COM 간 거리 점수
-    com_mesh = mesh_for_overlap.center_mass
+    # com_mesh = mesh_for_overlap.center_mass
     direction = (c_a - c_b) / width
     dist_inertia = point_line_distance(c_b, direction, com_mesh)
     s_inertia = 1 - dist_inertia / bbox_diag
 
+    # Patch Area 간 차이에 따른 지표(비슷할수록 큼)
+    if patch_a.area > 0 and patch_b.area > 0:
+        s_area = min(patch_a.area / patch_b.area, patch_b.area / patch_a.area)
+    else:
+        s_area = 0.0
+
+
     # 최종 점수(가중합)
-    score = params.distance_weight * s_distance + params.overlap_weight * s_overlap + params.inertia_weight * s_inertia
+    score = (params.distance_weight * s_distance +
+            #  params.overlap_weight * s_overlap +
+             params.inertia_weight * s_inertia +
+             params.area_weight * s_area)
 
     return PatchPairCandidate(
         patch_i=patch_a.id,
@@ -536,11 +614,18 @@ def score_patch_pair(patch_a: PlanarPatch,
         width=width,
         score=score,
         terms={
-            "overlap": s_overlap,
             "distance": s_distance,
-            # "inertia": s_inertia
-              },
+            "inertia": s_inertia,
+            "area": s_area,
+            "overlap": s_overlap # score 합산 미반영
+            },
     )
+
+
+# --------------------------
+# Grasping metric: Epsilon-Quality metric 
+# --------------------------
+#### TODO: Grasping metric 작성하기
 
 
 # --------------------------
@@ -548,25 +633,25 @@ def score_patch_pair(patch_a: PlanarPatch,
 # --------------------------
 def compute_best_patch_pairs(
     mesh_path: str,
-    mesh_max_triangles: int = 500,         # 원본 mesh 삼각형 개수
+    mesh_max_triangles: int = 1000,         # 원본 mesh 삼각형 개수
     angle_deg: float = 7.0,                # 패치 병합 허용 각도 (↑면 패치 수 ↓)
     # coplanar_tol: float = 1e-3,            # 공면성 허용 오차 (↑면 패치 수 ↓)
-    min_opening: float = 10.0,              # 그리퍼 최소 개구(mm)
+    min_opening: float = 1.0,              # 그리퍼 최소 개구(mm)
     max_opening: float = 140.0,              # 그리퍼 최대 개구(mm)
     angle_tolerance_deg: float = 10.0,     # 패치 페어 정반대 허용 각도
-    top_k: int = 1,                        # 상위 후보 수
+    top_k: int = 100,                        # 상위 후보 수
 ) -> Dict[str, Any]:
     
     mesh_filter, mesh_quad = load_uniform_mesh_with_open3d(mesh_path, target_triangles=mesh_max_triangles)
+
+    mesh_COM = mesh_quad.center_mass
+    mesh_bound = float(np.linalg.norm(mesh_quad.bounds[1] - mesh_quad.bounds[0]))
     # mesh_filter: (면적 기준 필터링 이후, watertight X), mesh_quad: (면적 기준 필터링 이전, watertight O)
     remesh = split_long_edges(mesh_filter)
-    remesh = merge_small_faces(remesh)
+    # remesh = merge_small_faces(remesh) # TODO: 형상 왜곡이 너무 심함 
 
-    # bbox_diag = float(np.linalg.norm(remesh.bounds[1] - remesh.bounds[0]))
-    # coplanar_tol = bbox_diag * 0.05
-    patches = extract_planar_patches(remesh, angle_deg=angle_deg)
-    # coplanar_tol=coplanar_tol)
-    patches = orient_patch_normals(mesh_quad, patches)  # 모두 바깥쪽으로 정렬
+    patches = extract_planar_patches(remesh, angle_deg=angle_deg) # coplanar_tol 삭제
+    patches = orient_patch_normals(mesh_quad, remesh, patches)  # 모두 바깥쪽으로 정렬
 
     params = PatchPairParams(
         min_opening=min_opening,
@@ -575,39 +660,42 @@ def compute_best_patch_pairs(
     )
 
     cands: List[PatchPairCandidate] = []
-    nvecs = [unit(np.array(p.normal)) for p in patches] # unit normals 
-    # 현재 패치와 normals가 angle_tolerance_deg 이하인 patch만 남김 (각도 180도 +- angle_tolerance_deg 범위)
-    for i in range(len(patches) - 1):
-        ni = nvecs[i]
 
-        best_cand = None
-        best_score = -1.0
+    # patch pair 탐색 및 scoring
+    for i, j in itertools.combinations(range(len(patches)), 2):
+        patch_i = patches[i]
+        patch_j = patches[j]
+        ni = np.array(patch_i.normal)
+        nj = np.array(patch_j.normal)
+        ci = np.array(patch_i.centroid)
+        cj = np.array(patch_j.centroid)
 
-        for j in range(i + 1, len(patches)):
-            # i-j 법선 각도: 180° - tol 보다 작으면 충분히 반대가 아님 -> 스킵
-            dot = float(ni @ nvecs[j])
-            ang = math.degrees(math.acos(max(-1.0, min(1.0, dot))))
-            if ang < 180.0 - params.angle_tolerance_deg:
-                continue
+        # 평행성 검사: patch i-j 법선 각도가 180° - tol 보다 작으면 충분히 반대가 아님
+        dot_normal = float(ni @ nj)
+        ang_normal = math.degrees(math.acos(max(-1.0, min(1.0, dot_normal))))
+        if ang_normal < 180.0 - params.angle_tolerance_deg: 
+            continue
 
-            cand = score_patch_pair(patches[i], patches[j], params, remesh)
-            
-            # 기존 폭/면적/점수 필터
-            if cand.width < params.min_opening or cand.width > params.max_opening:
-                continue
-            if cand.terms['overlap'] <= 0: # 상호 겹치는 부분이 없는 pair는 넘김
-                continue
-            if cand.score <= 0.0:
-                continue
-            # print(i,j)
+        # 마주봄 검사: patch ci -> cj와 ni가 90도 이상, 
+        vec_ij, vec_ji = unit(cj - ci), unit(ci - cj)
+        dot_i, dot_j = float(vec_ij @ ni), float(vec_ji @ nj) 
+        ang_i = math.degrees(math.acos(max(-1.0, min(1.0, dot_i))))
+        ang_j = math.degrees(math.acos(max(-1.0, min(1.0, dot_j))))
+        if ang_i < 90.0 or ang_j < 90.0:
+            continue
 
-            # i에 대해 최고 점수만 유지
-            if cand.score > best_score:
-                best_score = cand.score
-                best_cand = cand
-
-        if best_cand is not None:
-            cands.append(best_cand)
+        # 검사 통과된 후보들에 대해 score 계산
+        cand = score_patch_pair(patch_i, patch_j, params, remesh, mesh_COM, mesh_bound)
+        
+        # 폭/면적/점수 필터
+        if cand.width < params.min_opening or cand.width > params.max_opening:
+            continue
+        if cand.terms['overlap'] <= 0: # 상호 겹치는 부분이 없는 pair는 넘김
+            continue
+        if cand.score <= 0.0:
+            continue
+        
+        cands.append(cand)
 
     cands.sort(key=lambda c: c.score, reverse=True)
 
@@ -630,14 +718,14 @@ def check_gripper_feasibility_faces_with_yaw(
     pad_w: float = PadParams.pad_w,
     pad_h: float = PadParams.pad_h,
     pad_d: float = PadParams.pad_d,
-    clearance_out: float = 20.0,
+    clearance_out: float = 10.0,
     # yaw_grid_deg = [0, 90, 30, -30, 60, -60],
     yaw_grid_deg = [0, 90],
     use_mesh: str = "mesh_patches",
     check_mesh: str = "mesh_quad"
 ):
-    mesh_ch = result[check_mesh] # 간섭 검사용: 면적 필터 안 된 메시 
     mesh    = result[use_mesh]
+    mesh_ch = result[check_mesh] # 간섭 검사용: 면적 필터 안 된 메시 
     patches = {p["id"]: p for p in result["patches"]}
     pairs   = result.get("top_k", [])
 
@@ -679,8 +767,10 @@ def check_gripper_feasibility_faces_with_yaw(
             if best_j is None:
                 continue
             # 엇갈린 face pair 건너뛰기
-            alignment_dist = point_line_distance(ci, -n_i, best_cj)
-            if alignment_dist > max(pad_w, pad_h) / 2:
+            alignment_dist_i = point_line_distance(ci, -n_i, best_cj)
+            alignment_dist_j = point_line_distance(best_cj, -n_j, ci)
+            dist_criteria = min(pad_w, pad_h) / 3 # 엇갈림 기준
+            if alignment_dist_i > dist_criteria or alignment_dist_j > dist_criteria:
                 continue
 
             for yaw in yaw_grid_deg:
@@ -695,33 +785,23 @@ def check_gripper_feasibility_faces_with_yaw(
                 # 충돌이 발생하면 이 yaw는 건너뛰고 다음 yaw를 검사.
                 if cm.in_collision_single(box_i): continue
                 if cm.in_collision_single(box_j): continue
-
-                # 충돌이 없으면, 이 yaw는 가능한 후보. yaw 값에 대한 리포트를 생성.
-                closing_dir_base = unit(n_i - n_j)
-                u, v, n_basis = basis_from_normal(closing_dir_base)
-                B = np.column_stack([u, v, n_basis])
-                Rz_mat = Rotz(yaw)
-                R_world = B @ Rz_mat
-                pad_w_dir = R_world[:, 0]
-
+                
+                # 리포트 생성
+                cand_report = dict(
+                    pair_index=k, patch_i=pid_i, patch_j=pid_j,
+                    face_i=f_i, face_j=best_j, feasible=True, feasible_yaw=yaw
+                )
+                                
                 midpoint = 0.5 * (ci + best_cj)
-                # current_dist_inertia = point_line_distance(midpoint, pad_w_dir, com)
                 current_dist = np.linalg.norm(midpoint - com)
                 
                 Fi = -n_i; Fj = -n_j
                 tau = np.cross(ci - com, Fi) + np.cross(best_cj - com, Fj)
                 current_moment = float(np.linalg.norm(tau))
                 
-                # 리포트를 생성하고 리스트에 추가.
-                cand_report = dict(
-                    pair_index=k,
-                    patch_i=pid_i, patch_j=pid_j,
-                    face_i=f_i, face_j=best_j,
-                    feasible=True,
-                    feasible_yaw=yaw, # 현재 yaw 값을 저장
-                    moment=current_moment,
-                    dist=current_dist
-                )
+                # 리포트에 메트릭 추가
+                cand_report['moment'] = current_moment
+                cand_report['dist'] = current_dist
                 reports_for_this_pair.append(cand_report)
 
         if not reports_for_this_pair:
@@ -729,11 +809,113 @@ def check_gripper_feasibility_faces_with_yaw(
         else:
             reports.extend(reports_for_this_pair)
 
+    # 1. feasible=True 먼저
+    # 2. dist 낮은 순서 (오름차순, 동점자 처리)
+    # 3. moment 낮은 순서 (오름차순, 동점자 처리)
     reports_sorted = sorted(
-        reports, key=lambda r: (not r.get("feasible", False),
-                                r.get("dist", float("inf")),
-                                r.get("moment", float("inf")))
+        [r for r in reports if r.get("feasible")], # 유효한 리포트만 정렬
+        key=lambda r: (
+            r.get("dist", float("inf")),
+            r.get("moment", float("inf"))
+            ),
+        reverse=False
     )
+
+    return reports_sorted
+
+
+def check_gripper_feasibility_faces_with_rotation(
+    result: dict,
+    pad_w: float = PadParams.pad_w,
+    pad_h: float = PadParams.pad_h,
+    pad_d: float = PadParams.pad_d,
+    clearance_out: float = 10.0,
+    use_mesh: str = "mesh_patches",
+    check_mesh: str = "mesh_quad"
+):
+    mesh    = result[use_mesh]
+    mesh_ch = result[check_mesh] # 간섭 검사용: 면적 필터 안 된 메시 
+    patches = {p["id"]: p for p in result["patches"]}
+    pairs   = result.get("top_k", [])
+
+    try:    com = mesh_ch.center_mass
+    except: com = 0.5 * (mesh_ch.bounds[0] + mesh_ch.bounds[1])
+
+    cm = trimesh.collision.CollisionManager()
+    cm.add_object("part", mesh_ch) # 간섭 검사용: 면적 필터 안 된 메시 
+
+    reports = []
+    for k, cand in enumerate(pairs):
+        pid_i, pid_j = cand["patch_i"], cand["patch_j"]
+        if pid_i not in patches or pid_j not in patches:
+            reports.append(dict(pair_index=k, feasible=False))
+            continue
+        p_i, p_j = patches[pid_i], patches[pid_j]
+        n_i = unit(np.asarray(p_i["normal"], float))
+        n_j = unit(np.asarray(p_j["normal"], float))
+
+        # pair별로 가능한 모든 후보를 찾기
+        mesh_F, mesh_V = mesh.faces, mesh.vertices
+        for f_i in p_i["face_indices"]:
+            ci = mesh_V[mesh_F[f_i]].mean(axis=0)
+
+            best_j   = None
+            best_cj  = None
+            best_scr = -1.0
+            for f_j in p_j["face_indices"]:
+                cj = mesh_V[mesh_F[f_j]].mean(axis=0)
+                d  = cj - ci
+                nd = np.linalg.norm(d)
+                if nd < 1e-12:
+                    continue
+                d_hat = d / nd
+                scr = abs(float(d_hat @ (-n_i))) * abs(float((-d_hat) @ n_j))
+                if scr > best_scr:
+                    best_scr, best_j, best_cj = scr, f_j, cj
+            if best_j is None:
+                continue
+            # 엇갈린 face pair 건너뛰기
+            alignment_dist_i = point_line_distance(ci, -n_i, best_cj)
+            alignment_dist_j = point_line_distance(best_cj, -n_j, ci)
+            dist_criteria = min(pad_w, pad_h) / 3
+            if alignment_dist_i > dist_criteria or alignment_dist_j > dist_criteria:
+                continue
+
+            cyl_i = make_pad_cylinder_at_patch({"centroid": ci, "normal": n_i}, pad_w, pad_h, pad_d, clearance_out)
+            cyl_j = make_pad_cylinder_at_patch({"centroid": best_cj, "normal": n_j}, pad_w, pad_h, pad_d, clearance_out)
+
+            if not cm.in_collision_single(cyl_i) and not cm.in_collision_single(cyl_j):
+                midpoint = 0.5 * (ci + best_cj)
+                current_dist = np.linalg.norm(midpoint - com)
+                Fi = -n_i # 힘 방향 (normal의 반대)
+                Fj = -n_j
+                tau = np.cross(ci - com, Fi) + np.cross(best_cj - com, Fj)
+                current_moment = float(np.linalg.norm(tau))
+
+                report = dict(
+                    pair_index=k,
+                    patch_i=pid_i,
+                    patch_j=pid_j,
+                    face_i=f_i,
+                    face_j=best_j,
+                    dist=current_dist,
+                    moment=current_moment,
+                    feasible=True # 원기둥 검사 통과 의미
+                )
+                reports.append(report)
+
+    # 1. feasible=True 먼저
+    # 2. dist 낮은 순서 (오름차순, 동점자 처리)
+    # 3. moment 낮은 순서 (오름차순, 동점자 처리)
+    reports_sorted = sorted(
+        [r for r in reports if r.get("feasible")], # 유효한 리포트만 정렬
+        key=lambda r: (
+            r.get("dist", float("inf")),
+            r.get("moment", float("inf"))
+            ),
+        reverse=False
+    )
+
     return reports_sorted
 
 
@@ -851,7 +1033,7 @@ def ee_delta_pose_des(H_OC: np.ndarray, H_OG: np.ndarray):
 
     # 고정변환
     H_GnEn = to44(Rotx(180) @ Rotz(90), [0,0,-135])   # EE -> Grip (TODO 위 반영 업뎃)
-    H_GnCn = to44(np.eye(3), [10,60,15])           # Cam -> Grip [0,48,6]
+    H_GnCn = to44(np.eye(3), [10,60,15])           # Cam -> Grip [18,48,0] <- 실측, [10,60,15] <- 실험
     H_CnGn = np.linalg.inv(H_GnCn)
     H_CnEn = H_GnEn @ H_CnGn                        # EE -> Cam
     H_EG = np.linalg.inv(H_GnEn)

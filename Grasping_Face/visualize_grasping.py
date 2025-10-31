@@ -2,6 +2,8 @@ import numpy as np
 import plotly.graph_objects as go
 import trimesh
 from dataclasses import dataclass
+from scipy.spatial import ConvexHull
+from plotly.subplots import make_subplots
 
 # -------------------------------
 # helpers
@@ -164,6 +166,34 @@ def make_pad_box_at_patch_with_yaw(patch, pad_w, pad_h, pad_d, yaw_deg):
 
     return box
 
+def make_pad_cylinder_at_patch(patch, pad_w, pad_h, pad_d,
+                               lift_mm: float = 2.0):
+    """
+    패치 중심에서 normal 방향으로 회전하는 패드+클리어런스의 swept volume을 근사하는 원기둥 메쉬를 생성
+    Returns:
+        trimesh.Trimesh: 원기둥 메쉬 객체.
+    """
+    n = unit(np.asarray(patch["normal"], float))
+    c = np.asarray(patch["centroid"], float)
+
+    height = float(pad_d)
+    radius = 0.5 * np.sqrt(pad_w**2 + pad_h**2)
+
+    cylinder = trimesh.creation.cylinder(radius=radius, height=height, sections=16)
+
+    # 1. Z축을 normal 벡터 n으로 회전
+    transform_rot = trimesh.geometry.align_vectors([0, 0, 1], n)
+    # 2. 원기둥의 중심을 패치 중심에서 lift_mm + height/2 만큼 이동
+    center_translation = c + n * (lift_mm + 0.5 * height)
+    transform_trans = trimesh.transformations.translation_matrix(center_translation)
+    # 변환 행렬 결합 (회전 후 이동)
+    transform_matrix = transform_trans @ transform_rot
+    # 원기둥에 변환 적용
+    cylinder.apply_transform(transform_matrix)
+
+    return cylinder
+
+
 def frame_traces(H, name, scale=20.0, legendgroup=None, showlegend=False):
     """
     4x4 pose 행렬 H 기준 좌표축(x=red, y=green, z=blue) 시각화
@@ -291,6 +321,12 @@ def visualize_merged_patches_plotly(result,
     traces.append(cones_for_normals(patches, mesh_bounds=mesh_sil.bounds, normal_scale=50.0,
                                      min_len_ratio=0.1, color=normal_color, name="normals"))
     
+    # COM 넣기
+    com = mesh_sil.center_mass
+    traces.append(go.Scatter3d(x=[com[0]],y=[com[1]],z=[com[2]],
+                               mode='markers', marker=dict(size=10,color='red',symbol='diamond',opacity=0.9),
+                               name='Center of Mass'))
+
     fig = go.Figure(traces)
     fig.update_layout(
         title=f"Patches (count={len(patches)})",
@@ -389,6 +425,7 @@ def visualize_pairs_centroid_lines(result,
 # -------------------------------
 # 3) feasible patch pair 시각화
 # -------------------------------
+# pad mesh 있는 버전
 def visualize_feasible_pairs_pads(result, reports,
                                   show_silhouette=True,
                                   pad_w=PadParams.pad_w,
@@ -433,12 +470,13 @@ def visualize_feasible_pairs_pads(result, reports,
         box_j = make_pad_box_at_patch_with_yaw({"centroid": cj, "normal": nj}, pad_w, pad_h, pad_d, yaw_deg=-yaw_deg)
 
         # legendgroup으로 두 pad를 하나의 토글 그룹에 묶기
-        lg = f"pair {idx} - faces {fi, fj}"
+        lg = f"pair {idx} - faces {fi, fj} - yaw {yaw_deg}"
         # proxy(범례 핸들) – 클릭 시 그룹 전체 토글
         traces.append(go.Scatter3d(
             x=[ci[0]], y=[ci[1]], z=[ci[2]],
             mode="markers", marker=dict(size=1, opacity=0.0),
             name=lg, legendgroup=lg, showlegend=True))
+        # 그리퍼 패드 시각화
         # pad_i
         x,y,z = box_i.vertices.T; I,J,K = box_i.faces.T
         traces.append(go.Mesh3d(x=x,y=y,z=z,i=I,j=J,k=K,
@@ -449,6 +487,235 @@ def visualize_feasible_pairs_pads(result, reports,
         traces.append(go.Mesh3d(x=x,y=y,z=z,i=I,j=J,k=K,
                                 color=col, opacity=0.2,
                                 name=f"{lg} - pad_j", legendgroup=lg, showlegend=False))
+        # 중심선
+        traces.append(go.Scatter3d(
+            x=[ci[0], cj[0]], y=[ci[1], cj[1]], z=[ci[2], cj[2]],
+            mode="lines", line=dict(color=col, width=5),
+            name=f"{lg} - centerline", legendgroup=lg, showlegend=False))
+
+    fig = go.Figure(traces)
+    fig.update_layout(
+        title=f"Feasible Pairs — Pads only (count={len(ok_idx)})",
+        margin=dict(l=0,r=0,t=48,b=0),
+        showlegend=True,
+        legend=dict(groupclick="togglegroup"),  # ← 그룹 단위 토글
+        scene=dict(
+            xaxis=dict(range=[cx-max_range, cx+max_range], showgrid=False, zeroline=False),
+            yaxis=dict(range=[cy-max_range, cy+max_range], showgrid=False, zeroline=False),
+            zaxis=dict(range=[cz-max_range, cz+max_range], showgrid=False, zeroline=False),
+            aspectmode="cube"
+        )
+    )
+    if show:
+        fig.show(renderer="browser")
+
+    return fig
+
+# pad mesh 없는 버전
+def visualize_feasible_pairs_with_yaw(result, reports,
+                             show_silhouette=True,
+                             pad_w=PadParams.pad_w,
+                             pad_h=PadParams.pad_h,
+                             pad_d=PadParams.pad_d,
+                             show=False):
+    mesh = result.get("mesh_quad")
+    mesh_patches = result.get("mesh_patches")
+    patches = {p["id"]: p for p in result["patches"]}
+    pairs = result.get("top_k", [])
+
+    ok_idx = [r["pair_index"] for r in reports if r.get("feasible")]
+    # print(ok_idx)
+
+    if not ok_idx:
+        raise ValueError("feasible pair가 없습니다.")
+
+    (xmin, ymin, zmin), (xmax, ymax, zmax) = mesh.bounds
+    cx, cy, cz = (xmax+xmin)/2, (ymax+ymin)/2, (zmax+zmin)/2
+    max_range  = max(xmax-xmin,ymax-ymin,zmax-zmin)
+
+    traces=[]
+    if show_silhouette:
+        traces.append(mesh3d_from_trimesh(mesh, color="#cfcfcf", opacity=0.5, name="mesh"))
+
+    for k, idx in enumerate(ok_idx):
+        if idx >= len(pairs): continue
+        cand = pairs[idx]
+        yaw_deg = reports[k]['feasible_yaw']
+        pid_i, pid_j = cand["patch_i"], cand["patch_j"]
+        if pid_i not in patches or pid_j not in patches: continue
+        pi, pj = patches[pid_i], patches[pid_j]
+        col = hsv(k, len(ok_idx), s=0.55, v=0.95)
+
+        # pad boxes + rot
+        fi, fj = reports[k]["face_i"], reports[k]["face_j"]
+        ci = mesh_patches.vertices[mesh_patches.faces[fi]].mean(axis=0)
+        cj = mesh_patches.vertices[mesh_patches.faces[fj]].mean(axis=0)
+
+        # legendgroup으로 두 pad를 하나의 토글 그룹에 묶기
+        lg = f"pair {idx} - faces {fi, fj} - yaw {yaw_deg}"
+        # proxy(범례 핸들) – 클릭 시 그룹 전체 토글
+        traces.append(go.Scatter3d(
+            x=[ci[0]], y=[ci[1]], z=[ci[2]],
+            mode="markers", marker=dict(size=1, opacity=0.0),
+            name=lg, legendgroup=lg, showlegend=True))
+
+        # 중심선
+        traces.append(go.Scatter3d(
+            x=[ci[0], cj[0]], y=[ci[1], cj[1]], z=[ci[2], cj[2]],
+            mode="lines", line=dict(color=col, width=5),
+            name=f"{lg} - centerline", legendgroup=lg, showlegend=False))
+
+    fig = go.Figure(traces)
+    fig.update_layout(
+        title=f"Feasible Pairs — Pads only (count={len(ok_idx)})",
+        margin=dict(l=0,r=0,t=48,b=0),
+        showlegend=True,
+        legend=dict(groupclick="togglegroup"),  # ← 그룹 단위 토글
+        scene=dict(
+            xaxis=dict(range=[cx-max_range, cx+max_range], showgrid=False, zeroline=False),
+            yaxis=dict(range=[cy-max_range, cy+max_range], showgrid=False, zeroline=False),
+            zaxis=dict(range=[cz-max_range, cz+max_range], showgrid=False, zeroline=False),
+            aspectmode="cube"
+        )
+    )
+    if show:
+        fig.show(renderer="browser")
+
+    return fig
+
+def visualize_feasible_pairs_with_cylinder(result, reports,
+    show_silhouette=True,
+    pad_w=PadParams.pad_w,
+    pad_h=PadParams.pad_h,
+    pad_d=PadParams.pad_d,
+    lift_mm: float = 2.0,       # 원기둥 생성에 필요
+    show=False
+):
+
+    mesh = result.get("mesh_quad")
+    mesh_patches = result.get("mesh_patches")
+    patches = {p["id"]: p for p in result["patches"]}
+    pairs = result.get("top_k", [])
+
+    ok_idx = [r["pair_index"] for r in reports if r.get("feasible")]
+    # print(ok_idx)
+
+    if not ok_idx:
+        raise ValueError("feasible pair가 없습니다.")
+
+    (xmin, ymin, zmin), (xmax, ymax, zmax) = mesh.bounds
+    cx, cy, cz = (xmax+xmin)/2, (ymax+ymin)/2, (zmax+zmin)/2
+    max_range  = max(xmax-xmin,ymax-ymin,zmax-zmin)
+
+    traces=[]
+    if show_silhouette:
+        traces.append(mesh3d_from_trimesh(mesh, color="#cfcfcf", opacity=0.5, name="mesh"))
+
+    for k, idx in enumerate(ok_idx):
+        if idx >= len(pairs): continue
+        cand = pairs[idx]
+        pid_i, pid_j = cand["patch_i"], cand["patch_j"]
+        if pid_i not in patches or pid_j not in patches: continue
+        pi, pj = patches[pid_i], patches[pid_j]
+        col = hsv(k, len(ok_idx), s=0.55, v=0.95)
+
+        # pad boxes + rot
+        fi, fj = reports[k]["face_i"], reports[k]["face_j"]
+        ni = unit(np.asarray(pi["normal"], float))
+        nj = unit(np.asarray(pj["normal"], float))
+        ci = mesh_patches.vertices[mesh_patches.faces[fi]].mean(axis=0)
+        cj = mesh_patches.vertices[mesh_patches.faces[fj]].mean(axis=0)
+
+        # legendgroup 생성
+        lg = f"Pair {idx} | Faces ({fi}, {fj})"
+
+        # --- 원기둥 생성 및 추가 ---
+        # cyl_i = make_pad_cylinder_at_patch({"centroid": ci, "normal": ni}, pad_w, pad_h, pad_d, lift_mm)
+        # cyl_j = make_pad_cylinder_at_patch({"centroid": cj, "normal": nj}, pad_w, pad_h, pad_d, lift_mm)
+
+        # # 원기둥 i trace 추가
+        # x,y,z = cyl_i.vertices.T; I,J,K = cyl_i.faces.T
+        # traces.append(go.Mesh3d(x=x,y=y,z=z,i=I,j=J,k=K,
+        #                         color=col, opacity=0.2,
+        #                         name=f"{lg} - cyl_i", legendgroup=lg, showlegend=False))
+        # # 원기둥 j trace 추가
+        # x,y,z = cyl_j.vertices.T; I,J,K = cyl_j.faces.T
+        # traces.append(go.Mesh3d(x=x,y=y,z=z,i=I,j=J,k=K,
+        #                         color=col, opacity=0.2,
+        #                         name=f"{lg} - cyl_j", legendgroup=lg, showlegend=False))
+
+        # 중심선
+        traces.append(go.Scatter3d(
+            x=[ci[0], cj[0]], y=[ci[1], cj[1]], z=[ci[2], cj[2]],
+            mode="lines", line=dict(color=col, width=5), # 중심선은 원래 색상
+            name=f"{lg}", legendgroup=lg, showlegend=True
+        ))
+
+    fig = go.Figure(traces)
+    fig.update_layout(
+        title=f"Feasible Swept Volumes (Cylinders) (count={len(ok_idx)})", # 제목 변경
+        margin=dict(l=0, r=0, t=48, b=0),
+        showlegend=True,
+        legend=dict(groupclick="togglegroup"),
+        scene=dict(
+            xaxis=dict(range=[cx - max_range, cx + max_range], showgrid=False, zeroline=False),
+            yaxis=dict(range=[cy - max_range, cy + max_range], showgrid=False, zeroline=False),
+            zaxis=dict(range=[cz - max_range, cz + max_range], showgrid=False, zeroline=False),
+            aspectmode="cube" # aspectmode 변경 (데이터 비율에 맞게)
+        )
+    )
+    if show:
+        fig.show(renderer="browser")
+
+    return fig
+
+# pad mesh 없는 버전
+def visualize_feasible_pairs(result, reports,
+                             show_silhouette=True,
+                             pad_w=PadParams.pad_w,
+                             pad_h=PadParams.pad_h,
+                             pad_d=PadParams.pad_d,
+                             show=False):
+    mesh = result.get("mesh_quad")
+    mesh_patches = result.get("mesh_patches")
+    patches = {p["id"]: p for p in result["patches"]}
+    pairs = result.get("top_k", [])
+
+    ok_idx = [r["pair_index"] for r in reports if r.get("feasible")]
+    # print(ok_idx)
+
+    if not ok_idx:
+        raise ValueError("feasible pair가 없습니다.")
+
+    (xmin, ymin, zmin), (xmax, ymax, zmax) = mesh.bounds
+    cx, cy, cz = (xmax+xmin)/2, (ymax+ymin)/2, (zmax+zmin)/2
+    max_range  = max(xmax-xmin,ymax-ymin,zmax-zmin)
+
+    traces=[]
+    if show_silhouette:
+        traces.append(mesh3d_from_trimesh(mesh, color="#cfcfcf", opacity=0.5, name="mesh"))
+
+    for k, idx in enumerate(ok_idx):
+        if idx >= len(pairs): continue
+        cand = pairs[idx]
+        pid_i, pid_j = cand["patch_i"], cand["patch_j"]
+        if pid_i not in patches or pid_j not in patches: continue
+        pi, pj = patches[pid_i], patches[pid_j]
+        col = hsv(k, len(ok_idx), s=0.55, v=0.95)
+
+        # pad boxes + rot
+        fi, fj = reports[k]["face_i"], reports[k]["face_j"]
+        ci = mesh_patches.vertices[mesh_patches.faces[fi]].mean(axis=0)
+        cj = mesh_patches.vertices[mesh_patches.faces[fj]].mean(axis=0)
+
+        # legendgroup으로 두 pad를 하나의 토글 그룹에 묶기
+        lg = f"pair {idx} - faces {fi, fj}"
+        # proxy(범례 핸들) – 클릭 시 그룹 전체 토글
+        traces.append(go.Scatter3d(
+            x=[ci[0]], y=[ci[1]], z=[ci[2]],
+            mode="markers", marker=dict(size=1, opacity=0.0),
+            name=lg, legendgroup=lg, showlegend=True))
+
         # 중심선
         traces.append(go.Scatter3d(
             x=[ci[0], cj[0]], y=[ci[1], cj[1]], z=[ci[2], cj[2]],
@@ -517,10 +784,6 @@ def visualize_feasible_pairs_pads_gripper(result, reports,
         cj = mesh_patches.vertices[mesh_patches.faces[fj]].mean(axis=0)
         box_i = make_pad_box_at_patch_with_yaw({"centroid": ci, "normal": ni}, pad_w, pad_h, pad_d, yaw_deg= yaw_deg)
         box_j = make_pad_box_at_patch_with_yaw({"centroid": cj, "normal": nj}, pad_w, pad_h, pad_d, yaw_deg=-yaw_deg)
-        # ci = np.asarray(pi["centroid"], float)
-        # cj = np.asarray(pj["centroid"], float)
-        # box_i = make_pad_box_at_patch_with_yaw(pi, pad_w, pad_h, pad_d,  yaw_deg)
-        # box_j = make_pad_box_at_patch_with_yaw(pj, pad_w, pad_h, pad_d, -yaw_deg)
 
         # legendgroup 묶기
         lg = f"pair {idx}"
@@ -530,6 +793,7 @@ def visualize_feasible_pairs_pads_gripper(result, reports,
             mode="markers", marker=dict(size=1, opacity=0.0),
             name=lg, legendgroup=lg, showlegend=True
         ))
+        # 그리퍼 패드 시각화
         # pad_i
         x,y,z = box_i.vertices.T; I,J,K = box_i.faces.T
         traces.append(go.Mesh3d(x=x,y=y,z=z,i=I,j=J,k=K,
@@ -541,10 +805,9 @@ def visualize_feasible_pairs_pads_gripper(result, reports,
                                 color=col, opacity=0.2,
                                 name=f"{lg} - pad_j", legendgroup=lg, showlegend=False))
 
-        # gripper frame (build_gripper_pose_obj 함수 사용)
+        # gripper frame
         H_grip, stroke = build_gripper_pose_obj({"centroid": ci, "normal": ni}, {"centroid": cj, "normal": nj}, yaw_deg)
-        # H_grip, stroke = build_gripper_pose_obj(pi, pj, yaw_deg)
-
+        
         traces += frame_traces(H_grip, lg, scale=15.0, legendgroup=lg, showlegend=False)
 
     fig = go.Figure(traces)
@@ -818,3 +1081,5 @@ def visualize_frames(H_dict, scale=30.0, show=True, H_OdEn = None, result = None
     if save:
         fig.write_html(save_path)
     return fig
+
+
