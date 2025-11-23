@@ -7,7 +7,7 @@ import numpy as np
 import trimesh
 import open3d as o3d
 import itertools
-
+from scipy.spatial import ConvexHull
 
 @dataclass
 class PlanarPatch:
@@ -19,18 +19,16 @@ class PlanarPatch:
     centroid: List[float]
     centroid_check: List[float]
 
-
 @dataclass
 class PatchPairParams:
     min_opening: float = 1.0
     max_opening: float = 140.0
     angle_tolerance_deg: float = 15.0
-    overlap_weight:   float = 3 # TODO: 추후 다른 기준 추가 시 조정
-    distance_weight:  float = 1 # TODO: 추후 다른 기준 추가 시 조정
-    inertia_weight:   float = 1 # TODO: 추후 다른 기준 추가 시 조정
-    area_weight:      float = 1 # TODO: 추후 다른 기준 추가 시 조정
+    overlap_weight:   float = 1 # TODO: 추후 다른 기준 추가 시 조정
+    distance_weight:  float = 0.2 # TODO: 추후 다른 기준 추가 시 조정
+    inertia_weight:   float = 0.4 # TODO: 추후 다른 기준 추가 시 조정
+    area_weight:      float = 0.4 # TODO: 추후 다른 기준 추가 시 조정
     samples_per_face= 3          # face 샘플링 개수
-
 
 @dataclass
 class PatchPairCandidate:
@@ -41,18 +39,18 @@ class PatchPairCandidate:
     score: float
     terms: Dict[str, float]
 
-
 @dataclass
-class PadParams:
+class PadParams: # Robotiq AG145 기준
     pad_w: float = 34.0 # 34
     pad_h: float = 21.0 # 21
     pad_d: float = 7.0 # 7
+    mu: float = 0.8
 
 
 # --------------------------
 # Mesh helpers
 # --------------------------
-def load_uniform_mesh_with_open3d(path, target_triangles=500, min_area=0.01): # TODO: min_area 기준 업데이트 필요
+def load_uniform_mesh_with_open3d(path, target_triangles=500, min_area=0.001): # TODO: min_area 기준 업데이트 필요
     # Trimesh로 읽고 Open3D Mesh로 변환
     mesh_true = trimesh.load(path, force='mesh')
     if isinstance(mesh_true, trimesh.Scene):
@@ -78,9 +76,10 @@ def load_uniform_mesh_with_open3d(path, target_triangles=500, min_area=0.01): # 
     v0, v1, v2 = V[F[:,0]], V[F[:,1]], V[F[:,2]]
     areas = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
 
-    # min_area = np.min(mesh_quad.facets_area) * 2
-    # mask = areas >= float(min_area)
-    mask = areas >= 0.0
+    # TODO: 
+    mask = areas >= float(min_area)
+    # mask = areas >= 0.0
+
     F = F[mask]
 
     # 4) Trimesh로 반환
@@ -199,15 +198,32 @@ def plane_from_points(points: np.ndarray) -> Tuple[np.ndarray, float]:
     b = float(n @ centroid)
     return n, b
 
+# def point_line_distance(c_a:np.ndarray, n_a:np.ndarray, c_b:np.ndarray):
+    # """
+    # c_a 시작점, n_a 방향, c_b 거리측정 목표지점
+    # """
+    # n_u = unit(n_a)
+    # r = c_b - c_a
+    # t = float(np.dot(r, n_u)) # 직선 파라미터
+    # dist = float(np.linalg.norm(r - t * n_u))
+    # return dist
+
 def point_line_distance(c_a:np.ndarray, n_a:np.ndarray, c_b:np.ndarray):
     """
-    c_a 시작점, n_a 방향, c_b 거리측정 목표지점
+    c_a: 반직선(ray)의 시작점
+    n_a: 반직선의 방향 벡터
+    c_b: 거리 측정 목표 지점
     """
     n_u = unit(n_a)
+    # 반직선 시작점에서 목표점까지의 벡터
     r = c_b - c_a
-    t = float(np.dot(r, n_u)) # 직선 파라미터
-    dist = float(np.linalg.norm(r - t * n_u))
+    t = float(np.dot(r, n_u))
+    if t >= 0.0:
+        dist = float(np.linalg.norm(r - t * n_u))
+    else:
+        dist = float(np.linalg.norm(r)) # == np.linalg.norm(c_b - c_a)
     return dist
+
 
 def basis_from_normal(n: np.ndarray):
     n = unit(n)
@@ -332,8 +348,7 @@ def make_pad_box_at_patch(patch, pad_w, pad_h, pad_d, clearance_out,
     T = np.eye(4)
     T[:3, :3] = np.column_stack([u, v, n])
     T[:3,  3] = c + n * (lift_mm + 0.5*ext_z)
-    # T[:3,  3] = c + n*0.5*ext_z
-    # + n * lift_mm
+
     box.apply_transform(T)
     return box
 
@@ -373,10 +388,10 @@ def make_pad_cylinder_at_patch(patch, pad_w, pad_h, pad_d, clearance_out,
     패치 중심에서 normal 방향으로 회전하는 패드+클리어런스의 swept volume을 근사하는 원기둥 메쉬를 생성
 
     Args:
-        patch: 패치 정보 (dict or object, 'centroid', 'normal' 필요).
-        pad_w, pad_h, pad_d: 패드 크기.
-        clearance_out: 패드 바깥쪽 클리어런스.
-        lift_mm: 패치 표면에서 얼마나 띄울지.
+        patch: 패치 정보 (dict or object, 'centroid', 'normal' 필요)
+        pad_w, pad_h, pad_d: 패드 크기
+        clearance_out: 패드 바깥쪽 간격
+        lift_mm: 패치 표면에서 띄울 수치
 
     Returns:
         trimesh.Trimesh: 원기둥 메쉬 객체.
@@ -385,7 +400,8 @@ def make_pad_cylinder_at_patch(patch, pad_w, pad_h, pad_d, clearance_out,
     c = np.asarray(patch["centroid"], float)
 
     height = float(pad_d + clearance_out)
-    radius = 0.5 * np.sqrt(pad_w**2 + pad_h**2)
+    # radius = 0.5 * np.sqrt(pad_w**2 + pad_h**2)
+    radius = 0.5 * min(pad_w, pad_h)
 
     cylinder = trimesh.creation.cylinder(radius=radius, height=height, sections=16)
 
@@ -407,15 +423,14 @@ def make_pad_cylinder_at_patch(patch, pad_w, pad_h, pad_d, clearance_out,
 def extract_planar_patches(
     mesh: trimesh.Trimesh,
     angle_deg: float = 15.0,
-    # coplanar_tol: float = 1e-3,
 ) -> List[PlanarPatch]:
     face_normals = mesh.face_normals
     faces = mesh.faces
     face_adjacency = mesh.face_adjacency
     F = len(faces)
 
-    # min_patch_area = mesh.area * 0.001
-    min_patch_area = mesh.area * 0
+    min_patch_area = mesh.area * 0.0005
+    # min_patch_area = mesh.area * 0
     # max_patch_area = mesh.area * 0.0005
 
     neighbors = [[] for _ in range(F)]
@@ -451,10 +466,6 @@ def extract_planar_patches(
                 n_nb = face_normals[nb]
                 if abs(float(n_seed @ n_nb)) < cos_th:
                     continue
-                # verts_nb = tri_verts[nb].reshape(-1, 3)
-                # d = np.abs((verts_nb @ n_seed) - b_seed)
-                # if np.max(d) > coplanar_tol:
-                #     continue
                 used[nb] = True
                 region.append(nb)
                 queue.append(nb)
@@ -498,28 +509,7 @@ def orient_patch_normals(mesh_quad: trimesh.Trimesh, mesh_patches: trimesh.Trime
         n = np.asarray(p.normal if hasattr(p, "normal") else p["normal"], float)
         n = unit(n)
 
-        # # plan A: Patch centroid에서 normal로 나가면서 검사
-        # stp = np.asarray(p.centroid_check if hasattr(p, "centroid_check") else p["centroid_check"], float) # 기준 변경: max - min 중앙 지점 / 무게중심
-        # eps = bbox_diag * 0.01
-        # flip = False
-        # for scale in range(1, 11):
-        #     contain1 = mesh_quad.contains([stp + eps * n])[0] # normal 방향으로 이동
-        #     contain2 = mesh_quad.contains([stp - eps * n])[0] # normal 반대로 이동
-
-        #     if contain1 != contain2: # 둘이 다를 경우
-        #         flip = contain1  # 안이면 뒤집어 바깥 향하게
-        #         break
-        #     else: # 둘이 같을 경우
-        #         eps = eps * scale # 탐색 길이 늘리기
-        # if flip:
-        #     n = -n
-        # # 반영
-        # if hasattr(p, "normal"):
-        #     p.normal = n.tolist()
-        # else:
-        #     p["normal"] = n.tolist()
-
-        # plan B: Patch 내 첫번째 Face에서 normal로 나가면서 검사
+        # Patch 내 첫번째 Face에서 normal로 나가면서 검사
         f = p.face_indices[0]
         stp = mesh_V[mesh_F[f]].mean(axis=0) # 기준 변경: patch 무게중심 -> 단일 face 중심
         eps = bbox_diag * 0.01
@@ -584,14 +574,15 @@ def score_patch_pair(patch_a: PlanarPatch,
 
     # TODO: c-n 최소 거리 점수: c-n 직선과 c간의 거리 점수(패치 2개의 평행성 검사 2)
     # bbox_diag = float(np.linalg.norm(mesh_for_overlap.bounds[1] - mesh_for_overlap.bounds[0]))
-    dist_a = point_line_distance(c_a, n_a, c_b)
-    dist_b = point_line_distance(c_b, n_b, c_a)
+    dist_a = point_line_distance(c_a, -n_a, c_b)
+    dist_b = point_line_distance(c_b, -n_b, c_a)
     s_distance = 1 - (dist_a + dist_b) / bbox_diag
 
     # TODO: 회전 관성 점수: ca-cb 직선과 mesh COM 간 거리 점수
     # com_mesh = mesh_for_overlap.center_mass
-    direction = (c_a - c_b) / width
-    dist_inertia = point_line_distance(c_b, direction, com_mesh)
+    direction_a, direction_b = (c_b - c_a) / width, (c_a - c_b) / width
+    dist_COM_a, dist_COM_b = point_line_distance(c_a, direction_a, com_mesh), point_line_distance(c_b, direction_b, com_mesh)
+    dist_inertia = max(dist_COM_a, dist_COM_b)
     s_inertia = 1 - dist_inertia / bbox_diag
 
     # Patch Area 간 차이에 따른 지표(비슷할수록 큼)
@@ -623,19 +614,12 @@ def score_patch_pair(patch_a: PlanarPatch,
 
 
 # --------------------------
-# Grasping metric: Epsilon-Quality metric 
-# --------------------------
-#### TODO: Grasping metric 작성하기
-
-
-# --------------------------
 # Main API
 # --------------------------
 def compute_best_patch_pairs(
     mesh_path: str,
     mesh_max_triangles: int = 1000,         # 원본 mesh 삼각형 개수
     angle_deg: float = 7.0,                # 패치 병합 허용 각도 (↑면 패치 수 ↓)
-    # coplanar_tol: float = 1e-3,            # 공면성 허용 오차 (↑면 패치 수 ↓)
     min_opening: float = 1.0,              # 그리퍼 최소 개구(mm)
     max_opening: float = 140.0,              # 그리퍼 최대 개구(mm)
     angle_tolerance_deg: float = 10.0,     # 패치 페어 정반대 허용 각도
@@ -648,9 +632,9 @@ def compute_best_patch_pairs(
     mesh_bound = float(np.linalg.norm(mesh_quad.bounds[1] - mesh_quad.bounds[0]))
     # mesh_filter: (면적 기준 필터링 이후, watertight X), mesh_quad: (면적 기준 필터링 이전, watertight O)
     remesh = split_long_edges(mesh_filter)
-    # remesh = merge_small_faces(remesh) # TODO: 형상 왜곡이 너무 심함 
+    # remesh = merge_small_faces(remesh) # TODO: 형상 왜곡이 너무 심해서 제거
 
-    patches = extract_planar_patches(remesh, angle_deg=angle_deg) # coplanar_tol 삭제
+    patches = extract_planar_patches(remesh, angle_deg=angle_deg)
     patches = orient_patch_normals(mesh_quad, remesh, patches)  # 모두 바깥쪽으로 정렬
 
     params = PatchPairParams(
@@ -719,8 +703,8 @@ def check_gripper_feasibility_faces_with_yaw(
     pad_h: float = PadParams.pad_h,
     pad_d: float = PadParams.pad_d,
     clearance_out: float = 10.0,
-    # yaw_grid_deg = [0, 90, 30, -30, 60, -60],
-    yaw_grid_deg = [0, 90],
+    yaw_grid_deg = [0, 90, 45, -45],
+    # yaw_grid_deg = [0, 90],
     use_mesh: str = "mesh_patches",
     check_mesh: str = "mesh_quad"
 ):
@@ -766,10 +750,12 @@ def check_gripper_feasibility_faces_with_yaw(
                     best_scr, best_j, best_cj = scr, f_j, cj
             if best_j is None:
                 continue
+
             # 엇갈린 face pair 건너뛰기
             alignment_dist_i = point_line_distance(ci, -n_i, best_cj)
             alignment_dist_j = point_line_distance(best_cj, -n_j, ci)
-            dist_criteria = min(pad_w, pad_h) / 3 # 엇갈림 기준
+            dist_criteria = min(pad_w, pad_h) / 5 # 엇갈림 기준
+            # dist_criteria = 5 # 엇갈림 기준, mm
             if alignment_dist_i > dist_criteria or alignment_dist_j > dist_criteria:
                 continue
 
@@ -782,24 +768,32 @@ def check_gripper_feasibility_faces_with_yaw(
                     {"centroid": best_cj, "normal": n_j},
                     pad_w, pad_h, pad_d, clearance_out, yaw_deg=-yaw
                 )
-                # 충돌이 발생하면 이 yaw는 건너뛰고 다음 yaw를 검사.
+                # 충돌이 발생하면 이 yaw는 건너뛰고 다음 yaw를 검사
                 if cm.in_collision_single(box_i): continue
                 if cm.in_collision_single(box_j): continue
                 
-                # 리포트 생성
+                # 충돌이 없는 경우, 리포트 생성
                 cand_report = dict(
                     pair_index=k, patch_i=pid_i, patch_j=pid_j,
                     face_i=f_i, face_j=best_j, feasible=True, feasible_yaw=yaw
                 )
-                                
+
+                # # Metric 0: Epsilon Quality (TODO: 실행시간 얼마나 달라지는지 확인)
+                # current_epsilon = calculate_squeeze_epsilon_quality(
+                #     mesh, p_i['face_indices'], p_j['face_indices'],
+                #     ci, n_i, yaw, best_cj, n_j, -yaw, com )
+
+                # Metric 1: Face Pair to COM 거리   
                 midpoint = 0.5 * (ci + best_cj)
                 current_dist = np.linalg.norm(midpoint - com)
                 
+                # Metric 2: COM에 가해지는 토크 합산 (Force Closure)   
                 Fi = -n_i; Fj = -n_j
                 tau = np.cross(ci - com, Fi) + np.cross(best_cj - com, Fj)
                 current_moment = float(np.linalg.norm(tau))
                 
                 # 리포트에 메트릭 추가
+                # cand_report['epsilon'] = current_epsilon 
                 cand_report['moment'] = current_moment
                 cand_report['dist'] = current_dist
                 reports_for_this_pair.append(cand_report)
@@ -809,16 +803,15 @@ def check_gripper_feasibility_faces_with_yaw(
         else:
             reports.extend(reports_for_this_pair)
 
-    # 1. feasible=True 먼저
-    # 2. dist 낮은 순서 (오름차순, 동점자 처리)
-    # 3. moment 낮은 순서 (오름차순, 동점자 처리)
+    # epsilon 높은 / dist 낮은 / moment 낮은 순서로 정렬 (오름차순, 동점자 처리)
     reports_sorted = sorted(
         [r for r in reports if r.get("feasible")], # 유효한 리포트만 정렬
         key=lambda r: (
-            r.get("dist", float("inf")),
-            r.get("moment", float("inf"))
+            # r.get("epsilon", -1.0),
+            -r.get("dist", float("inf")),
+            -r.get("moment", float("inf"))
             ),
-        reverse=False
+        reverse=True
     )
 
     return reports_sorted
@@ -877,20 +870,20 @@ def check_gripper_feasibility_faces_with_rotation(
             # 엇갈린 face pair 건너뛰기
             alignment_dist_i = point_line_distance(ci, -n_i, best_cj)
             alignment_dist_j = point_line_distance(best_cj, -n_j, ci)
-            dist_criteria = min(pad_w, pad_h) / 3
+            dist_criteria = min(pad_w, pad_h) / 5 # 엇갈림 기준
             if alignment_dist_i > dist_criteria or alignment_dist_j > dist_criteria:
                 continue
 
-            cyl_i = make_pad_cylinder_at_patch({"centroid": ci, "normal": n_i}, pad_w, pad_h, pad_d, clearance_out)
-            cyl_j = make_pad_cylinder_at_patch({"centroid": best_cj, "normal": n_j}, pad_w, pad_h, pad_d, clearance_out)
+            cyl_i = make_pad_cylinder_at_patch({"centroid": ci,      "normal": n_i}, pad_w / 2, pad_h / 2, pad_d, clearance_out)
+            cyl_j = make_pad_cylinder_at_patch({"centroid": best_cj, "normal": n_j}, pad_w / 2, pad_h / 2, pad_d, clearance_out)
 
             if not cm.in_collision_single(cyl_i) and not cm.in_collision_single(cyl_j):
                 midpoint = 0.5 * (ci + best_cj)
-                current_dist = np.linalg.norm(midpoint - com)
-                Fi = -n_i # 힘 방향 (normal의 반대)
+                current_dist = np.linalg.norm(midpoint - com) # 두 점으로 잡았을 때 중간점 <-> mesh COM 거리
+                Fi = -n_i # 힘 방향 (normal의 반대) 
                 Fj = -n_j
                 tau = np.cross(ci - com, Fi) + np.cross(best_cj - com, Fj)
-                current_moment = float(np.linalg.norm(tau))
+                current_moment = float(np.linalg.norm(tau)) # 두 점으로 잡았을 때 걸리는 모멘트
 
                 report = dict(
                     pair_index=k,
@@ -917,6 +910,259 @@ def check_gripper_feasibility_faces_with_rotation(
     )
 
     return reports_sorted
+
+# --------------------------
+# Grasping metric: Epsilon-Quality metric 
+# --------------------------
+
+# --------------------------
+# TODO: 점 접촉 Epsilon-Quality metric: 제거 예정 
+# --------------------------
+def get_friction_cone_vectors(normal: np.ndarray, mu: float = PadParams.mu, k: int = 6) -> List[np.ndarray]:
+    """
+    주어진 법선 벡터(inward normal)와 마찰 계수(mu)에 대해,
+    마찰 콘(friction cone)을 근사하는 k개의 단위 힘 벡터(primitive force vectors)를 생성
+    
+    Args:
+        normal (np.ndarray): 3D inward normal vector (그리퍼가 물체를 누르는 방향).
+        mu (float): 마찰 계수 (e.g., 0.5). mu = tan(alpha).
+        k (int): 근사 벡터의 개수 (e.g., 4 또는 8).
+
+    Returns:
+        List[np.ndarray]: k개의 단위 힘 벡터 리스트.
+    """
+    u, v, n = basis_from_normal(normal)
+    
+    vectors = []
+    for i in range(k):
+        angle = 2.0 * np.pi * i / k
+        
+        # 1. 접선 벡터(tangent vector)를 생성합니다.
+        # 이 벡터는 마찰력의 방향을 나타냅니다.
+        tangent_vec = u * np.cos(angle) + v * np.sin(angle)
+        
+        # 2. 법선 벡터와 마찰 벡터를 결합합니다.
+        # f = n + mu * tangent_vec
+        # 이 힘 벡터 f는 마찰 콘의 경계(edge)를 따라 형성됩니다.
+        f = n + mu * tangent_vec
+        
+        # 3. 단위 벡터로 정규화하여 'primitive force'를 만듭니다.
+        vectors.append(unit(f))
+        
+    return vectors
+
+def calculate_epsilon_quality(
+    c_i: np.ndarray, 
+    n_i: np.ndarray, 
+    c_j: np.ndarray, 
+    n_j: np.ndarray, 
+    com: np.ndarray, 
+    mu: float = PadParams.mu, 
+    k: int = 16
+) -> float:
+    """
+    두 접촉점(i, j)에 대한 6D Grasp Wrench Space (GWS)의 
+    epsilon-quality (force closure) 계산
+    Args:
+        c_i, c_j (np.ndarray): 3D 접촉점 (e.g., face centroids).
+        n_i, n_j (np.ndarray): 3D *outward* surface normals.
+        com (np.ndarray): 객체의 3D Center of Mass.
+        mu (float): 마찰 계수 (coefficient of friction).
+        k (int): 마찰 콘 근사를 위한 벡터 수.
+
+    Returns:
+        float: Epsilon-quality (epsilon). 0.0 이면 force closure 실패.
+    """
+    
+    # 1. 법선 벡터를 'inward normal' (그리퍼가 누르는 방향)으로 뒤집습니다.
+    inward_n_i = -unit(np.asarray(n_i))
+    inward_n_j = -unit(np.asarray(n_j))
+    
+    # 2. 각 접촉점에서 마찰 콘을 근사하는 k개의 단위 힘 벡터(primitive forces)를 얻습니다.
+    cone_vecs_i = get_friction_cone_vectors(inward_n_i, mu, k)
+    cone_vecs_j = get_friction_cone_vectors(inward_n_j, mu, k)
+    
+    # 3. 각 힘 벡터가 COM(Center of Mass) 기준으로 생성하는 Wrench(f, tau)를 계산합니다.
+    r_i = np.asarray(c_i) - np.asarray(com) # COM에서 접촉점 i까지의 벡터
+    r_j = np.asarray(c_j) - np.asarray(com) # COM에서 접촉점 j까지의 벡터
+    
+    wrenches = []
+    # 접촉점 i에 대한 렌치
+    for f_i in cone_vecs_i:
+        tau_i = np.cross(r_i, f_i)
+        wrenches.append(np.concatenate([f_i, tau_i]))
+        
+    # 접촉점 j에 대한 렌치
+    for f_j in cone_vecs_j:
+        tau_j = np.cross(r_j, f_j)
+        wrenches.append(np.concatenate([f_j, tau_j]))
+        
+    wrenches = np.array(wrenches)
+    
+    # 4. 모든 렌치 벡터를 사용하여 6D Convex Hull (GWS)을 계산합니다.
+    if wrenches.shape[0] <= 6:
+        return 0.0  # 6D Hull을 만들기에 점이 부족합니다.
+
+    try:
+        hull = ConvexHull(wrenches, qhull_options="QJ")
+    except Exception as e:
+        # print(f"Convex Hull 6D Error: {e}")
+        return 0.0  # 점들이 6D 공간을 채우지 못하고 저차원 평면에 존재 (e.g., 2D 물체)
+
+    # 5. Epsilon-quality 계산: 원점(0,0,0,0,0,0)에서 GWS의 가장 가까운 경계면(hyperplane)까지의 거리
+    min_dist = float('inf')
+    
+    # hull.equations는 [A, b] 형태이며, Ax + b >= 0 이 Hull의 내부를 정의합니다.
+    # (scipy는 법선(A)이 Hull 외부를 가리키므로, 원점이 내부(Ax+b >= 0)에 있으려면 b >= 0 이어야 합니다)
+    for eq in hull.equations:
+        A, b = eq[:-1], eq[-1]
+        
+        # 원점이 Hull 내부에 있는지 확인 (b < 0 이면 원점이 외부에 있음)
+        if b < -1e-9: # 수치적 안정성을 위해 작은 음수 허용
+            return 0.0  # Force closure 실패 (Epsilon = 0)
+            
+        # 원점에서 평면까지의 거리: |A*x + b| / ||A||, (x=0 이므로 |b| / ||A||)
+        dist = np.abs(b) / (np.linalg.norm(A) + 1e-9)
+        
+        if dist < min_dist:
+            min_dist = dist
+            
+    # 원점이 내부에 있고(b >= 0), 가장 가까운 평면까지의 거리가 epsilon 값입니다.
+    return min_dist
+# --------------------------
+# TODO: 점 접촉 Epsilon-Quality metric: 제거 예정 
+# --------------------------
+
+
+# Friction Cone Wrench 계산
+def add_wrenches(points, normal, com, ch_len, mu=PadParams.mu, k=8):
+    # Tangent, Bitangent
+    t, b, _ = basis_from_normal(normal)
+    angle_step = 2 * np.pi / k
+    wrenches = []
+    for pt in points:
+        r = pt - com # 모멘트 암
+        for i in range(k):
+            theta = i * angle_step
+            # Force direction (Normal + Friction)
+            f = normal + mu * np.cos(theta) * t + mu * np.sin(theta) * b
+            f = f / np.linalg.norm(f) # 스케일링
+            # Torque
+            tau = np.cross(r, f)
+            # Wrench
+            # w = np.concatenate([f, tau / ch_len]) # 토크를 Characteristic Length로 힘/토크 스케일 보정
+            w = np.concatenate([f, tau])
+            wrenches.append(w)
+    
+    return np.array(wrenches)
+
+# Pad 위치에 따른 Contact Points 찾기
+def get_points_in_squeezed_pad(mesh, patch_info, 
+                               pad_w, pad_h, pad_d, 
+                               yaw_deg=0.0, 
+                               squeeze_depth=0.1, 
+                            #    sample_count=100 # sample_surface 사용시
+    ):
+    """
+    패드를 물체 안쪽으로 squeeze_depth만큼 밀어넣었을 때,
+    패드 영역 안에 포함되는 물체 표면의 점들을 반환
+    """
+    # 1. 물체 표면에서 점 샘플링
+    # samples, _ = trimesh.sample.sample_surface(mesh, sample_count) # submesh 내부 점 샘플링
+    samples = mesh.vertices # submesh의 삼각형 점 사용
+
+    if len(samples) == 0:
+        return np.array([]), None   
+
+    # 2. 패드 박스(OBB) 생성
+    pad_box = trimesh.creation.box(extents=[pad_w, pad_h, pad_d])
+    
+    # 패치 정보
+    c = np.asarray(patch_info["centroid"])
+    n = unit(np.asarray(patch_info["normal"]))
+    
+    # 3. 패드 회전 및 이동 (Pose 변환)
+    # R_align = trimesh.geometry.align_vectors([0, 0, 1], n) # Normal 정렬 회전 (Z축 -> Normal)
+    u, v, n_vec = basis_from_normal(n)
+    R_align = np.eye(4)
+    R_align[:3, :3] = np.column_stack([u, v, n_vec]) # [u, v, n] 순서로 회전 행렬 구성
+
+    rad = np.deg2rad(yaw_deg) # Yaw 회전 (Normal 축 기준)
+    R_yaw = trimesh.transformations.rotation_matrix(rad, [0, 0, 1])
+
+    # 3-3. 이동 (Translation): 패드 접촉 면이 물체 표면에서 squeeze_depth 만큼 들어가게 함
+    offset_dist = (pad_d / 2.0) - squeeze_depth # 패드 중심점 오프셋
+    t_vec = c + n * offset_dist # 
+    
+    T = np.eye(4)
+    T[:3, 3] = t_vec
+    
+    # 최종 변환 행렬: T @ R_align @ R_yaw
+    final_pose = T @ R_align @ R_yaw
+    pad_box.apply_transform(final_pose)
+    
+    # 4. 포함 여부 검사 (Points inside Box): samples 점들이 pad_box 안에 있는지 확인
+    is_inside = pad_box.contains(samples)
+    contact_points = samples[is_inside]
+    
+    return contact_points, pad_box # 시각화를 위해 pad_box도 반환
+
+def calculate_squeeze_epsilon_quality(mesh, f_i_idx, f_j_idx, c_i, n_i, yaw_i, c_j, n_j, yaw_j, com,
+                                      pad_w=PadParams.pad_w,
+                                      pad_h=PadParams.pad_h,
+                                      pad_d=PadParams.pad_d,
+                                      squeeze_depth=0.1, # mm 단위 접촉 면 깊이
+    # 해당 패치 근처의 face들만 서브셋으로 뽑아서 샘플링하면 더 빠름 (여기서는 전체 메쉬 사용 예시)
+    # 최적화를 위해 mesh.submesh([patch_face_indices]) 사용 권장
+                                      ):
+    """
+    양쪽 패드를 물체 쪽으로 squeeze_depth 만큼 침투시켰을 때
+    겹치는 영역의 점들을 사용하여 GWS 및 Epsilon Quality를 계산
+    """
+
+    # 1. 접촉점 추출 (Points containment)
+    # Patch I에 대한 서브메쉬
+    mesh_i = mesh.submesh([f_i_idx], append=True)
+    pts_i, _ = get_points_in_squeezed_pad(mesh_i, {"centroid": c_i, "normal": n_i}, 
+                                          pad_w, pad_h, pad_d, yaw_i, squeeze_depth)    
+    # Patch J에 대한 서브메쉬
+    mesh_j = mesh.submesh([f_j_idx], append=True)
+    pts_j, _ = get_points_in_squeezed_pad(mesh_j, {"centroid": c_j, "normal": n_j}, 
+                                          pad_w, pad_h, pad_d, yaw_j, squeeze_depth)
+
+    # 접촉점 검사
+    if len(pts_i) == 0 or len(pts_j) == 0: # 접촉점이 없는 경우 Grasping 없음
+        return 0.0
+
+    # 힘은 물체를 미는 방향이므로 -normal
+    ch_len = 0.5 * float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])) # RWS Characteristic Length = Radius 스케일링
+
+    wrenches_i = add_wrenches(pts_i, -n_i, com, ch_len)
+    wrenches_j = add_wrenches(pts_j, -n_j, com, ch_len)
+    wrenches = np.concatenate([wrenches_i, wrenches_j], axis=0)
+    
+    # 2. Convex Hull (GWS)
+    try:
+        if len(wrenches) < 4: return 0.0 # Contact Point 갯수가 너무 적으면 계산 안 됨
+        hull = ConvexHull(wrenches, qhull_options='QJ') # QJ: Joggled input (에러 방지)
+    except Exception as e:
+        # print(f"ConvexHull Error: {e}")
+        return 0.0
+
+    # 3. Epsilon Quality (원점에서 가장 가까운 면까지 거리)
+    min_dist = float('inf')
+    for eq in hull.equations:
+        # eq: [nx, ny, nz, nw, nt, nr, offset]
+        # distance from origin = abs(offset) / norm(normal)
+        # 원점이 내부: normal @ origin + offset <= 0 (offset <= 0)
+        dist = -eq[-1] 
+        if dist < min_dist:
+            min_dist = dist
+            
+    if min_dist < 0:
+        return 0.0
+
+    return min_dist
 
 
 # --------------------------
@@ -999,19 +1245,24 @@ def build_gripper_pose_obj_OPE(p_i, p_j, yaw_deg=0.0, H_OC=np.eye(4)):
 
     # 2. 방향 결정 로직 수정
     # OPE 결과(H_OC)를 이용해 그리퍼 z축(접근 방향)을 카메라 좌표계 기준으로 변환
-    z_axis_in_camera = H_OC[:3, :3] @ z_axis
-    # print(z_axis_in_camera)
-
     # 그리퍼의 접근 방향이 카메라 좌표계의 위쪽(-Z)을 향하면, z 축을 뒤집어 아래(+Z)를 향하도록 함
     # 카메라 좌표계: Z 정면, Y 아래, X 오른쪽
+    z_axis_in_camera = H_OC[:3, :3] @ z_axis
     if z_axis_in_camera[2] < 0: 
         z_axis = - z_axis  # pad w 방향
         y_axis = - y_axis  # pad h 방향
         x_axis = np.cross(y_axis, z_axis)  # closing 방향
-        
+    # 로봇 6축의 불필요한 회전 방지를 위한 코드
+    x_axis_in_camera = H_OC[:3, :3] @ x_axis
+    y_axis_in_camera = H_OC[:3, :3] @ y_axis
+    if x_axis_in_camera[0] < 0 and y_axis_in_camera[1] < 0: 
+        x_axis = - x_axis
+        y_axis = - y_axis
+
     # 직교 보정 (x,y,z 순서)
     R = np.column_stack([x_axis, y_axis, z_axis])
     
+    # 그리퍼 스트로크에 따른 위치 반영
     stroke = np.linalg.norm(cj - ci)
     d = origin_offset_from_stroke(stroke)
     o = o_pad + (- z_axis * d)
@@ -1032,8 +1283,8 @@ def ee_delta_pose_des(H_OC: np.ndarray, H_OG: np.ndarray):
     # H_E = np.eye(4,4) # TODO: 로봇 컨트롤러 신호 받아 변환행렬 만들기 (현재는 EE 좌표계 기준이라 개발 필요 X)
 
     # 고정변환
-    H_GnEn = to44(Rotx(180) @ Rotz(90), [0,0,-135])   # EE -> Grip (TODO 위 반영 업뎃)
-    H_GnCn = to44(np.eye(3), [10,60,15])           # Cam -> Grip [18,48,0] <- 실측, [10,60,15] <- 실험
+    H_GnEn = to44(Rotx(180) @ Rotz(90), [0,0,-135])   # EE -> Grip [0,0,-135] <- 실측
+    H_GnCn = to44(np.eye(3), [30,58,10])           # Cam -> Grip [18,45,10] <- 실측, [30,58,10] <- 실험
     H_CnGn = np.linalg.inv(H_GnCn)
     H_CnEn = H_GnEn @ H_CnGn                        # EE -> Cam
     H_EG = np.linalg.inv(H_GnEn)
@@ -1044,3 +1295,4 @@ def ee_delta_pose_des(H_OC: np.ndarray, H_OG: np.ndarray):
     H_GdEn = H_OdEn @ H_OG
     H_EdEn = H_GdEn @ H_EG
     return H_EdEn, H_OdEn
+

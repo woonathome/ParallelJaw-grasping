@@ -63,7 +63,23 @@ def load_json(path):
         info = json.load(f)
     return info
 
-# torch.cuda.empty_cache()
+def get_available_objects(base_path='./models_target/models_cad/custom'):
+    """custom 폴더 내의 obj 파일 리스트를 반환하고 출력합니다."""
+    # 경로 내의 .obj 파일 검색
+    files = glob.glob(os.path.join(base_path, "*.obj"))
+    files.sort() # 이름순 정렬
+    
+    obj_list = []
+    print("\n" + "="*40)
+    print(" [ Select Target Object ]")
+    for idx, fpath in enumerate(files):
+        # 파일명에서 확장자 제거하여 object_id 추출
+        filename = os.path.basename(fpath)
+        obj_id = os.path.splitext(filename)[0]
+        obj_list.append(obj_id)
+        print(f" {idx} : {obj_id}")
+    print("="*40 + "\n")
+    return obj_list
 
 ############### Settings ###############
 SCENE_DATE = time.strftime("%Y%m%d_%H%M%S")
@@ -648,14 +664,14 @@ def get_object_grasping(target_mesh_file = cad_path,
         # pair 검사 및 실제로 feasible한 pair 만 남김
         # 그리퍼 접근 각도 30도 이하인 경우
         z_H_EdEn = H_EdEn[:3,2] # z축 각도 필터링용
-        if np.dot(z_H_EdEn, np.array([0,0,1])) < 0.7: 
+        if np.dot(z_H_EdEn, np.array([0,0,1])) < 0.6: 
             continue
         # # 그리퍼 패드 - 바닥 간섭 검사
         pad_diagonal = np.sqrt(pad_params.pad_w**2 + pad_params.pad_h**2)
         pad_radius = pad_diagonal / 2.0
         H_OdEn_rot = H_OdEn[:3,:3]
         O_rotated = H_OdEn_rot @ mesh_patches.vertices.T
-        z_check = O_rotated[-1,:].min() + pad_radius
+        z_check = O_rotated[-1,:].min() + pad_radius / 1.0
         ci_world = H_OdEn_rot @ ci
         cj_world = H_OdEn_rot @ cj
         # print(f'{ci[2]:.3f}, {cj[2]:.3f}, {ci_world[2]:.3f}, {cj_world[2]:.3f}')
@@ -752,16 +768,21 @@ def send_command(IP, PORT, res):
 def RT_inference(comm = False, IP = '', PORT = ''):
     global SCENE_ID
     global SCENE_DATE
-
-    # 1. 모델 미리 로드 (권장: 느려도 최초 1회만!)
-    model_ism = ISM_load()
+    global object_id # 전역 변수 업데이트를 위해 선언
+    
+    # 초기 설정 (기본값으로 로드하되, 실제 추론 시에는 선택된 값으로 덮어씌워짐)
+    # 초기 로딩 시간을 줄이고 싶다면 model_ism 로딩을 'i' 누른 직후로 미룰 수도 있으나,
+    # 메모리 할당 등을 미리 해두기 위해 기본값(bracket_1 등)으로 먼저 로드합니다.
+    print("=> Initializing Models...")
+    model_ism = ISM_load() 
     cfg = PEM_init()
     model_pem = PEM_load(cfg)
     
     # 2. 카메라 오픈
     pipeline, align = RT_get_realsense_stream()
 
-    print("Realtime framing... press 'i' to inference / 'ESC' to exit.")
+    print("\n[Ready] Realtime framing... \n -> Press 'i' to Select Object & Inference \n -> Press 'ESC' to exit.")
+    
     while True:
         rgb_frame, depth_frame = RT_get_one_rgbd_frame(pipeline, align)
         if rgb_frame is None:
@@ -771,8 +792,56 @@ def RT_inference(comm = False, IP = '', PORT = ''):
         cv2.imshow("RGB Stream", rgb_frame)
         key = cv2.waitKey(1) & 0xFF
         
-        # 'i' 입력시 ISM+PEM 수행
+        # 'i' 입력시 객체 선택 및 추론 수행
         if key == ord('i'):
+            # --- [Step 1] 객체 목록 출력 및 선택 ---
+            obj_list = get_available_objects()
+            if not obj_list:
+                print("!!! No .obj files found in target directory.")
+                continue
+
+            try:
+                # OpenCV 창이 아닌 터미널에서 입력받음
+                selection = input(f"Input object number (0 ~ {len(obj_list)-1}): ")
+                sel_idx = int(selection)
+                if 0 <= sel_idx < len(obj_list):
+                    selected_obj_id = obj_list[sel_idx]
+                    print(f"=> Selected Object: '{selected_obj_id}'")
+                else:
+                    print("!!! Invalid number selected.")
+                    continue
+            except ValueError:
+                print("!!! Input is not a number. Cancelled.")
+                continue
+
+            # --- [Step 2] 선택된 객체로 경로 변수 업데이트 ---
+            # 전역 변수 업데이트 (혹은 로컬 변수로 관리하여 함수 인자로 전달)
+            object_id = selected_obj_id
+            
+            # 경로 재설정
+            cur_template_dir = f'./models_target/templates/{object_id}'
+            cur_cad_path     = f'./models_target/models_cad/custom/{object_id}.obj'
+            
+            # 템플릿 폴더 존재 여부 확인 (ISM 에러 방지)
+            if not os.path.exists(cur_template_dir) or not glob.glob(f"{cur_template_dir}/*.npy"):
+                print(f"!!! Error: Template directory for '{object_id}' is empty or missing.")
+                print(f"!!! Expected path: {cur_template_dir}")
+                print("!!! Please run template generation first.")
+                continue
+
+            # --- [Step 3] 모델 설정 업데이트 (ISM, PEM) ---
+            print(f"=> Reloading ISM templates for {object_id}...")
+            # ISM 모델에 새로운 템플릿 경로를 주어 재로딩 (모델 가중치는 유지하고 ref_data만 바꾸는 것이 효율적이나,
+            # 현재 구조상 함수 호출이 안전함)
+            model_ism = ISM_load(template_dir=cur_template_dir)
+            
+            print(f"=> Updating PEM config for {object_id}...")
+            cfg.template_dir = cur_template_dir
+            cfg.cad_path = cur_cad_path
+            # PEM 모델 자체는 재로딩할 필요 없지만, feature extraction을 위해 템플릿은 다시 읽어야 함
+            # 이는 PEM_run_save 내부에서 cfg.template_dir를 참조하여 수행되므로 cfg만 바꾸면 됨.
+
+            # --- [Step 4] 추론 시작 ---
             # 1. 프레임 저장 
             now_str = time.strftime("%Y%m%d_%H%M%S")
             rgb_save_path =   f"./RUN_result/input/now_rgb_{now_str}.png"
@@ -780,10 +849,11 @@ def RT_inference(comm = False, IP = '', PORT = ''):
             cv2.imwrite(rgb_save_path, rgb_frame)
             cv2.imwrite(depth_save_path, depth_frame)
 
-            # 2. ISM 추론
+            # 2. ISM 추론 (경로 명시적 전달)
             print("[Realtime] ISM running...")
             ism_result = ISM_run_save(
                 ISMmodel = model_ism, 
+                cad_path = cur_cad_path, # 명시적 전달
                 rgb_path = rgb_save_path, 
                 depth_path = depth_save_path,
                 save_img = True, 
@@ -793,42 +863,51 @@ def RT_inference(comm = False, IP = '', PORT = ''):
 
             # 3. PEM 추론
             print("[Realtime] PEM running...")
-            # config에서 해당 프레임 경로로 세팅 (필요시)
+            # config에서 해당 프레임 경로로 세팅
             cfg.rgb_path = rgb_save_path
             cfg.depth_path = depth_save_path
-            cfg.seg_path = f"{output_dir}/detection_ism_{now_str}_{object_id}.json"  # ISM 저장 경로
-            H_OC_best = PEM_run_save(model = model_pem,
-                                     cfg = cfg,
-                                     save_img = True,
-                                     tag = now_str) # best HM
+            cfg.seg_path = f"{output_dir}/detection_ism_{now_str}_{object_id}.json"
+            
+            H_OC_best = PEM_run_save(
+                model = model_pem,
+                cfg = cfg,
+                save_img = True,
+                tag = now_str
+            )
             print("[Realtime] PEM done!")
 
-            # 4. 그리핑 결과 전송 
+            # 4. 그리핑 결과 계산 및 전송 
             gsolpath = f"{output_dir}/vis_grasping_sol_{now_str}_{object_id}.html"
-            grip_result = get_object_grasping(H_OC=H_OC_best, save_path = gsolpath)
-            # for grip_res in grip_result:
-            #     print(grip_res)
-            grip_res = grip_result[0] # 첫번째 후보
-            if comm == True:
-                send_command(IP, PORT, grip_res)
+            
+            # get_object_grasping 호출 시 cad_path를 현재 선택된 파일로 전달
+            grip_result = get_object_grasping(
+                target_mesh_file = cur_cad_path, 
+                H_OC = H_OC_best, 
+                save_path = gsolpath
+            )
+            
+            if len(grip_result) > 0:
+                grip_res = grip_result[0] # 첫번째 후보
+                if comm == True:
+                    send_command(IP, PORT, grip_res)
+            else:
+                print("!!! No feasible grasping solution found.")
 
             # +. 결과 이미지 표시 
-            # ism_vis_path = f"{output_dir}/vis_ism_{now_str}_{object_id}.png"
-            # if os.path.exists(ism_vis_path):
-            #     ism_vis_img = cv2.imread(ism_vis_path)
-            #     cv2.imshow("ISM Result", ism_vis_img)
-            #     cv2.waitKey(1)
             pem_vis_path = f"{output_dir}/vis_pem_{now_str}_{object_id}.png"
             if os.path.exists(pem_vis_path):
                 pem_vis_img = cv2.imread(pem_vis_path)
                 cv2.imshow("PEM Result", pem_vis_img)
                 cv2.waitKey(1)
+            
+            print(f"\n[Done] Cycle complete for '{object_id}'. Press 'i' again for new task.\n")
 
         elif key == 27:  # ESC
             break
 
     pipeline.stop()
     cv2.destroyAllWindows()
+
 
 ################################# Sequence (Realtime) #################################
 if __name__ == "__main__":
