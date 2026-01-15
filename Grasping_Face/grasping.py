@@ -77,8 +77,8 @@ def load_uniform_mesh_with_open3d(path, target_triangles=500, min_area=0.001): #
     areas = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
 
     # TODO: 
-    mask = areas >= float(min_area)
-    # mask = areas >= 0.0
+    # mask = areas >= float(min_area)
+    mask = areas >= 0.0
 
     F = F[mask]
 
@@ -429,8 +429,8 @@ def extract_planar_patches(
     face_adjacency = mesh.face_adjacency
     F = len(faces)
 
-    min_patch_area = mesh.area * 0.0005
-    # min_patch_area = mesh.area * 0
+    # min_patch_area = mesh.area * 0.0005
+    min_patch_area = mesh.area * 0
     # max_patch_area = mesh.area * 0.0005
 
     neighbors = [[] for _ in range(F)]
@@ -512,9 +512,9 @@ def orient_patch_normals(mesh_quad: trimesh.Trimesh, mesh_patches: trimesh.Trime
         # Patch 내 첫번째 Face에서 normal로 나가면서 검사
         f = p.face_indices[0]
         stp = mesh_V[mesh_F[f]].mean(axis=0) # 기준 변경: patch 무게중심 -> 단일 face 중심
-        eps = bbox_diag * 0.01
+        eps = bbox_diag * 0.001
         flip = False
-        for scale in range(1, 11):
+        for scale in range(1, 100):
             contain1 = mesh_quad.contains([stp + eps * n])[0] # normal 방향으로 이동
             contain2 = mesh_quad.contains([stp - eps * n])[0] # normal 반대로 이동
 
@@ -703,8 +703,8 @@ def check_gripper_feasibility_faces_with_yaw(
     pad_h: float = PadParams.pad_h,
     pad_d: float = PadParams.pad_d,
     clearance_out: float = 10.0,
-    yaw_grid_deg = [0, 90, 45, -45],
-    # yaw_grid_deg = [0, 90],
+    # yaw_grid_deg = [0, 90, 45, -45],
+    yaw_grid_deg = [0, 90],
     use_mesh: str = "mesh_patches",
     check_mesh: str = "mesh_quad"
 ):
@@ -1279,7 +1279,7 @@ def ee_delta_pose_des(H_OC: np.ndarray, H_OG: np.ndarray):
     출력:
       H_EdEn : now EE 기준 des EE 포즈 (EE 움직일 상대 좌표)
     """
-    # # 좌표계 시각화
+    # 좌표계 시각화
     # H_E = np.eye(4,4) # TODO: 로봇 컨트롤러 신호 받아 변환행렬 만들기 (현재는 EE 좌표계 기준이라 개발 필요 X)
 
     # 고정변환
