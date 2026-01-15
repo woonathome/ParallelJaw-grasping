@@ -299,15 +299,31 @@ def ISM_run_save(ISMmodel = None, cad_path = cad_path, rgb_path = '', depth_path
     save_path = f"{output_dir}/detection_ism_{tag}_{object_id}"
     detections.save_to_file(0, 0, 0, save_path, "Custom", return_results=False)
     detections = convert_npz_to_json(idx=0, list_npz_paths=[save_path+".npz"])
-    save_json_bop23(save_path+".json", detections)
+
+    # --- [수정] ISM Score 기준 정렬, 상위 10개만 선택 ---
+    detections_sorted = sorted(detections, key=lambda d: d['score'], reverse=True)
+    detections_top10 = detections_sorted[:10]
+    save_json_bop23(save_path+".json", detections_top10)
 
     if save_img:
-        vis_img = ISM_visualize_all(rgb, detections, f"{output_dir}/vis_ism_{tag}_{object_id}.png")
+        # 시각화 시에도 Top 10 (혹은 정렬된 전체)을 사용
+        vis_img = ISM_visualize_all(rgb, detections_top10, f"{output_dir}/vis_ism_{tag}_{object_id}.png")
         vis_img.save(f"{output_dir}/vis_ism_{tag}_{object_id}.png")
 
     torch.cuda.empty_cache()
 
-    return detections
+    return detections_top10
+
+    # --- [수정전] ISM Score 기준으로 정렬하고 상위 10개만 선택 ---
+    # save_json_bop23(save_path+".json", detections)
+
+    # if save_img:
+    #     vis_img = ISM_visualize_all(rgb, detections, f"{output_dir}/vis_ism_{tag}_{object_id}.png")
+    #     vis_img.save(f"{output_dir}/vis_ism_{tag}_{object_id}.png")
+
+    # torch.cuda.empty_cache()
+
+    # return detections
 
 ##### Pose Estimation #####
 def PEM_visualize(rgb, pred_rot, pred_trans, model_points, K, save_path):

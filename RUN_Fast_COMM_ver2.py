@@ -84,12 +84,12 @@ def get_available_objects(base_path='./models_target/models_cad/custom'):
 ############### Settings ###############
 SCENE_DATE = time.strftime("%Y%m%d_%H%M%S")
 SCENE_ID  = '0'
-object_id = 'doorhandle'   # 'logitech_c930e_m' 'object_100'
+object_id = 'doorhandle'   # 'doorhandle' 'gluestick'
 
 # OPE model settings
 segmentor_model  = 'fastsam' # 'sam' , 'fastsam'
 
-template_dir = f'./models_target/templates/{object_id}' 
+template_dir = f'./models_target/templates/custom/{object_id}' 
 cad_path     = f'./models_target/models_cad/custom/{object_id}.obj'
 output_dir   =  './RUN_result/output'
 cam_path     = f'./RUN_result/test_rgbd/{time.strftime("%Y%m%d")}/scene_camera.json'
@@ -295,7 +295,7 @@ def ISM_run_save(ISMmodel = None, cad_path = cad_path, rgb_path = '', depth_path
     ISMmodel.ref_data["poses"] =  poses[load_index_level_in_level2(0, "all"), :, :]
 
     mesh = trimesh.load_mesh(cad_path)
-    model_points = mesh.sample(2048).astype(np.float32) / 1000.0
+    model_points = mesh.sample(512).astype(np.float32) / 1000.0 # 2048 points sampling
     ISMmodel.ref_data["pointcloud"] = torch.tensor(model_points).unsqueeze(0).data.to(device)
 
     image_uv = ISMmodel.project_template_to_image(best_template, pred_idx_objects, batch, detections.masks)
@@ -316,19 +316,19 @@ def ISM_run_save(ISMmodel = None, cad_path = cad_path, rgb_path = '', depth_path
     detections.save_to_file(0, 0, 0, save_path, "Custom", return_results=False)
     detections = convert_npz_to_json(idx=0, list_npz_paths=[save_path+".npz"])
 
-    # --- [수정] ISM Score 기준 정렬, 상위 10개만 선택 ---
+    # --- ISM Score 기준 정렬, 상위 n개만 선택 ---
     detections_sorted = sorted(detections, key=lambda d: d['score'], reverse=True)
-    detections_top10 = detections_sorted[:10]
-    save_json_bop23(save_path+".json", detections_top10)
+    detections_top = detections_sorted[:10]
+    save_json_bop23(save_path+".json", detections_top)
 
     if save_img:
         # 시각화 시에도 Top 10 (혹은 정렬된 전체)을 사용
-        vis_img = ISM_visualize_all(rgb, detections_top10, f"{output_dir}/vis_ism_{tag}_{object_id}.png")
+        vis_img = ISM_visualize_all(rgb, detections_top, f"{output_dir}/vis_ism_{tag}_{object_id}.png")
         vis_img.save(f"{output_dir}/vis_ism_{tag}_{object_id}.png")
 
     torch.cuda.empty_cache()
 
-    return detections_top10
+    return detections_top
 
     # --- [수정전] ISM Score 기준으로 정렬하고 상위 10개만 선택 ---
     # save_json_bop23(save_path+".json", detections)
@@ -530,9 +530,9 @@ def PEM_init(gpus = gpus, output_dir = output_dir, template_dir = template_dir, 
     cfg.cam_path = cam_path
     cfg.seg_path = seg_path
 
-    cfg.n_sample_observed_point = 2048  # 2048
-    cfg.n_sample_model_point = 256     # 1024
-    cfg.n_sample_template_point = 256  # 5000
+    cfg.n_sample_observed_point = 4096  # 2048
+    cfg.n_sample_model_point = 1024     # 1024
+    cfg.n_sample_template_point = 2048  # 5000
 
     cfg.det_score_thresh = det_score_thresh
     gorilla.utils.set_cuda_visible_devices(gpu_ids = cfg.gpus)
@@ -664,19 +664,22 @@ def get_object_grasping(target_mesh_file = cad_path,
         # pair 검사 및 실제로 feasible한 pair 만 남김
         # 그리퍼 접근 각도 30도 이하인 경우
         z_H_EdEn = H_EdEn[:3,2] # z축 각도 필터링용
-        if np.dot(z_H_EdEn, np.array([0,0,1])) < 0.6: 
+        # print(z_H_EdEn)
+        if np.dot(z_H_EdEn, np.array([0,0,1])) < 0.8: 
             continue
         # # 그리퍼 패드 - 바닥 간섭 검사
         pad_diagonal = np.sqrt(pad_params.pad_w**2 + pad_params.pad_h**2)
-        pad_radius = pad_diagonal / 2.0
+        pad_radius = pad_diagonal / 2.5
         H_OdEn_rot = H_OdEn[:3,:3]
         O_rotated = H_OdEn_rot @ mesh_patches.vertices.T
-        z_check = O_rotated[-1,:].min() + pad_radius / 1.0
+        z_check = O_rotated[-1,:].min() + pad_radius
         ci_world = H_OdEn_rot @ ci
         cj_world = H_OdEn_rot @ cj
-        # print(f'{ci[2]:.3f}, {cj[2]:.3f}, {ci_world[2]:.3f}, {cj_world[2]:.3f}')
-        if ci_world[2] < z_check or cj_world[2] < z_check:
-            continue
+        if ci_world[2] < z_check or cj_world[2] < z_check: # 바닥과 간섭 발생 시
+            lift_offset = pad_params.pad_w / 3.0
+            H_EdEn[2, 3] += lift_offset # 월드 Z축 기준 상승 (보편적 바닥 회피)
+            if ci_world[2] + lift_offset < z_check or cj_world[2] + lift_offset < z_check: # 이동 후에도 바닥과 간섭 발생 시
+                continue
 
         t_quat = H_EdEn[:3,3] / 1000
         res = {"pose_quat": np.concatenate([t_quat, r_quat]),
@@ -819,7 +822,7 @@ def RT_inference(comm = False, IP = '', PORT = ''):
             object_id = selected_obj_id
             
             # 경로 재설정
-            cur_template_dir = f'./models_target/templates/{object_id}'
+            cur_template_dir = f'./models_target/templates/custom/{object_id}'
             cur_cad_path     = f'./models_target/models_cad/custom/{object_id}.obj'
             
             # 템플릿 폴더 존재 여부 확인 (ISM 에러 방지)
@@ -911,4 +914,5 @@ def RT_inference(comm = False, IP = '', PORT = ''):
 
 ################################# Sequence (Realtime) #################################
 if __name__ == "__main__":
-    RT_inference(comm=True, IP='192.168.0.22', PORT=9900)
+    # RT_inference(comm=True, IP='192.168.0.22', PORT=9900)
+    RT_inference(comm=True, IP='127.0.0.1', PORT=9900)
