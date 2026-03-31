@@ -197,15 +197,7 @@ Main entry points:
 
 Visualization functions may display only a prefix of candidates/reports by default.
 
-## 8. Batch Result Export (Notebook)
-
-`GraspingTest.ipynb` includes batch execution for custom + BOP CAD datasets and saves HTML outputs under:
-
-- `./Grasping_Results/<dataset_name>/`
-
-Typical outputs include patch normals, patch-pair lines, and feasible grasp visualizations.
-
-## 9. Coverage vs Speed Tuning
+## 8. Coverage vs Speed Tuning
 
 If planar-heavy objects seem to lose too many pairs, increase coverage by tuning:
 
