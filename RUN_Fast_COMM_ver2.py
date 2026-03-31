@@ -774,8 +774,7 @@ def RT_inference(comm = False, IP = '', PORT = ''):
     global object_id # 전역 변수 업데이트를 위해 선언
     
     # 초기 설정 (기본값으로 로드하되, 실제 추론 시에는 선택된 값으로 덮어씌워짐)
-    # 초기 로딩 시간을 줄이고 싶다면 model_ism 로딩을 'i' 누른 직후로 미룰 수도 있으나,
-    # 메모리 할당 등을 미리 해두기 위해 기본값(bracket_1 등)으로 먼저 로드합니다.
+    # 메모리 할당 등을 미리 해두기 위해 기본값(bracket_1 등)으로 먼저 로드
     print("=> Initializing Models...")
     model_ism = ISM_load() 
     cfg = PEM_init()
