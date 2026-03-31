@@ -13,6 +13,12 @@ from . import grasping as gf
 # -------------------------------
 # Helpers (Visualization Specific)
 # -------------------------------
+def _get_feasible_reports(reports: List[Dict[str, Any]], max_show: Optional[int]) -> List[Dict[str, Any]]:
+    feasible_reports = [r for r in reports if r.get("feasible")]
+    if max_show is not None:
+        feasible_reports = feasible_reports[:max_show]
+    return feasible_reports
+
 
 def mesh3d_from_trimesh(
     m: trimesh.Trimesh, 
@@ -236,6 +242,7 @@ def visualize_pairs_centroid_lines(
     result: Dict[str, Any],
     show_silhouette: bool = True,
     patch_opacity: float = 0.3,
+    max_pairs_show: Optional[int] = 200,
     show: bool = False
 ) -> go.Figure:
     """
@@ -245,6 +252,8 @@ def visualize_pairs_centroid_lines(
     mesh_p: trimesh.Trimesh = result["mesh_patches"]
     patches = result["patches"]
     cands = result.get("top_k", [])
+    if max_pairs_show is not None:
+        cands = cands[:max_pairs_show]
     if not cands:
         raise ValueError("result['top_k'] is empty.")
 
@@ -318,6 +327,7 @@ def visualize_feasible_pairs_pads(
     pad_w: float = gf.PadParams.pad_w,
     pad_h: float = gf.PadParams.pad_h,
     pad_d: float = gf.PadParams.pad_d,
+    max_reports_show: Optional[int] = 300,
     show: bool = False
 ) -> go.Figure:
     
@@ -329,6 +339,10 @@ def visualize_feasible_pairs_pads(
     ok_idx = [r["pair_index"] for r in reports if r.get("feasible")]
     dists = [r["dist"] for r in reports if r.get("feasible")] # 무게중심 - pair 거리로 색상 코딩
     
+    feasible_reports = _get_feasible_reports(reports, max_reports_show)
+    ok_idx = [r["pair_index"] for r in feasible_reports]
+    dists = [r["dist"] for r in feasible_reports]
+
     if not dists:
         colval_min, colval_max = 0, 1
     else:
@@ -348,13 +362,16 @@ def visualize_feasible_pairs_pads(
     for k, idx in enumerate(ok_idx):
         if idx >= len(pairs): continue
         cand = pairs[idx]
+        report = feasible_reports[k]
         yaw_deg = reports[k]['feasible_yaw']
+        yaw_deg = report.get("feasible_yaw", yaw_deg)
         pid_i, pid_j = cand["patch_i"], cand["patch_j"]
         if pid_i not in patches or pid_j not in patches: continue
         pi, pj = patches[pid_i], patches[pid_j]
 
         # pad boxes + rot
         fi, fj = reports[k]["face_i"], reports[k]["face_j"]
+        fi, fj = report["face_i"], report["face_j"]
         ni = gf.unit(np.asarray(pi["normal"], float))
         nj = gf.unit(np.asarray(pj["normal"], float))
         ci = mesh_patches.vertices[mesh_patches.faces[fi]].mean(axis=0)
@@ -423,6 +440,7 @@ def visualize_feasible_pairs_with_yaw(
     pad_w: float = gf.PadParams.pad_w,
     pad_h: float = gf.PadParams.pad_h,
     pad_d: float = gf.PadParams.pad_d,
+    max_reports_show: Optional[int] = 300,
     show: bool = False
 ) -> go.Figure:
     
@@ -434,6 +452,10 @@ def visualize_feasible_pairs_with_yaw(
     ok_idx = [r["pair_index"] for r in reports if r.get("feasible")]
     dists = [r["dist"] for r in reports if r.get("feasible")]
     
+    feasible_reports = _get_feasible_reports(reports, max_reports_show)
+    ok_idx = [r["pair_index"] for r in feasible_reports]
+    dists = [r["dist"] for r in feasible_reports]
+
     if not dists:
         colval_min, colval_max = 0, 1
     else:
@@ -453,7 +475,9 @@ def visualize_feasible_pairs_with_yaw(
     for k, idx in enumerate(ok_idx):
         if idx >= len(pairs): continue
         cand = pairs[idx]
+        report = feasible_reports[k]
         yaw_deg = reports[k]['feasible_yaw']
+        yaw_deg = report.get("feasible_yaw", yaw_deg)
         pid_i, pid_j = cand["patch_i"], cand["patch_j"]
         if pid_i not in patches or pid_j not in patches: continue
         
@@ -462,6 +486,7 @@ def visualize_feasible_pairs_with_yaw(
 
         # pad boxes + rot
         fi, fj = reports[k]["face_i"], reports[k]["face_j"]
+        fi, fj = report["face_i"], report["face_j"]
         ci = mesh_patches.vertices[mesh_patches.faces[fi]].mean(axis=0)
         cj = mesh_patches.vertices[mesh_patches.faces[fj]].mean(axis=0)
 
@@ -508,6 +533,7 @@ def visualize_feasible_pairs_with_cylinder(
     pad_h: float = gf.PadParams.pad_h,
     pad_d: float = gf.PadParams.pad_d,
     lift_mm: float = 2.0,
+    max_reports_show: Optional[int] = 300,
     show: bool = False,
     vis_cyl: bool = True
 ) -> go.Figure:
@@ -520,6 +546,10 @@ def visualize_feasible_pairs_with_cylinder(
     ok_idx = [r["pair_index"] for r in reports if r.get("feasible")]
     dists = [r["dist"] for r in reports if r.get("feasible")]
     
+    feasible_reports = _get_feasible_reports(reports, max_reports_show)
+    ok_idx = [r["pair_index"] for r in feasible_reports]
+    dists = [r["dist"] for r in feasible_reports]
+
     if not dists:
         colval_min, colval_max = 0, 1
     else:
@@ -539,12 +569,14 @@ def visualize_feasible_pairs_with_cylinder(
     for k, idx in enumerate(ok_idx):
         if idx >= len(pairs): continue
         cand = pairs[idx]
+        report = feasible_reports[k]
         pid_i, pid_j = cand["patch_i"], cand["patch_j"]
         if pid_i not in patches or pid_j not in patches: continue
         pi, pj = patches[pid_i], patches[pid_j]
 
         # pad boxes + rot
         fi, fj = reports[k]["face_i"], reports[k]["face_j"]
+        fi, fj = report["face_i"], report["face_j"]
         ni = gf.unit(np.asarray(pi["normal"], float))
         nj = gf.unit(np.asarray(pj["normal"], float))
         ci = mesh_patches.vertices[mesh_patches.faces[fi]].mean(axis=0)
@@ -609,6 +641,7 @@ def visualize_feasible_pairs(
     result: Dict[str, Any], 
     reports: List[Dict[str, Any]],
     show_silhouette: bool = True,
+    max_reports_show: Optional[int] = 300,
     show: bool = False
 ) -> go.Figure:
     
@@ -620,6 +653,10 @@ def visualize_feasible_pairs(
     ok_idx = [r["pair_index"] for r in reports if r.get("feasible")]
     dists = [r["dist"] for r in reports if r.get("feasible")]
     
+    feasible_reports = _get_feasible_reports(reports, max_reports_show)
+    ok_idx = [r["pair_index"] for r in feasible_reports]
+    dists = [r["dist"] for r in feasible_reports]
+
     if not dists:
         colval_min, colval_max = 0, 1
     else:
@@ -639,12 +676,14 @@ def visualize_feasible_pairs(
     for k, idx in enumerate(ok_idx):
         if idx >= len(pairs): continue
         cand = pairs[idx]
+        report = feasible_reports[k]
         pid_i, pid_j = cand["patch_i"], cand["patch_j"]
         if pid_i not in patches or pid_j not in patches: continue
         # pi, pj = patches[pid_i], patches[pid_j]
 
         # pad boxes + rot
         fi, fj = reports[k]["face_i"], reports[k]["face_j"]
+        fi, fj = report["face_i"], report["face_j"]
         ci = mesh_patches.vertices[mesh_patches.faces[fi]].mean(axis=0)
         cj = mesh_patches.vertices[mesh_patches.faces[fj]].mean(axis=0)
 
@@ -694,6 +733,7 @@ def visualize_feasible_pairs_pads_gripper(
     pad_w: float = gf.PadParams.pad_w,
     pad_h: float = gf.PadParams.pad_h,
     pad_d: float = gf.PadParams.pad_d,
+    max_reports_show: Optional[int] = 300,
     show: bool = False
 ) -> go.Figure:
     
@@ -705,6 +745,10 @@ def visualize_feasible_pairs_pads_gripper(
     ok_idx = [r["pair_index"] for r in reports if r.get("feasible")]
     dists = [r["dist"] for r in reports if r.get("feasible")] # 무게중심 - pair 거리로 색상 코딩
     
+    feasible_reports = _get_feasible_reports(reports, max_reports_show)
+    ok_idx = [r["pair_index"] for r in feasible_reports]
+    dists = [r["dist"] for r in feasible_reports]
+
     if not dists:
         colval_min, colval_max = 0, 1
     else:
@@ -724,13 +768,16 @@ def visualize_feasible_pairs_pads_gripper(
     for k, idx in enumerate(ok_idx):
         if idx >= len(pairs): continue
         cand = pairs[idx]
+        report = feasible_reports[k]
         yaw_deg = reports[k].get('feasible_yaw', 0.0)
+        yaw_deg = report.get("feasible_yaw", yaw_deg)
         pid_i, pid_j = cand["patch_i"], cand["patch_j"]
         if pid_i not in patches or pid_j not in patches: continue
         pi, pj = patches[pid_i], patches[pid_j]
 
         # pad boxes + rot
         fi, fj = reports[k]["face_i"], reports[k]["face_j"]
+        fi, fj = report["face_i"], report["face_j"]
         ni = gf.unit(np.asarray(pi["normal"], float))
         nj = gf.unit(np.asarray(pj["normal"], float))
         ci = mesh_patches.vertices[mesh_patches.faces[fi]].mean(axis=0)

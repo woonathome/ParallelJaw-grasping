@@ -2,11 +2,10 @@
 
 import json, math
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 import trimesh
 import open3d as o3d
-import itertools
 from scipy.spatial import ConvexHull
 
 @dataclass
@@ -910,6 +909,775 @@ def check_gripper_feasibility_faces_with_rotation(
     )
 
     return reports_sorted
+
+# --------------------------
+# Performance-oriented overrides (v2)
+# --------------------------
+def split_long_edges(
+    mesh: trimesh.Trimesh,
+    max_iter: int = 100,
+    max_faces_after_split: int = 20000,
+    max_len: Optional[float] = None,
+):
+    """
+    Split long edges iteratively with a face-count guard to avoid mesh explosion.
+    """
+    if max_len is None:
+        max_len = float(min(PadParams.pad_h, PadParams.pad_w))
+
+    V = mesh.vertices.copy()
+    F = mesh.faces.copy()
+    if len(F) == 0:
+        return mesh.copy()
+
+    for _ in range(max_iter):
+        new_faces: List[List[int]] = []
+        new_vertices: List[np.ndarray] = []
+        added = False
+
+        for f in F:
+            tri = V[f]
+            edges = ((0, 1), (1, 2), (2, 0))
+            lens = [np.linalg.norm(tri[i] - tri[j]) for i, j in edges]
+            max_idx = int(np.argmax(lens))
+            i, j = edges[max_idx]
+            if lens[max_idx] > max_len and len(new_faces) < (2 * max_faces_after_split):
+                added = True
+                mid = 0.5 * (tri[i] + tri[j])
+                mid_idx = len(V) + len(new_vertices)
+                new_vertices.append(mid)
+                k = 3 - i - j
+                new_faces.append([int(f[i]), mid_idx, int(f[k])])
+                new_faces.append([mid_idx, int(f[j]), int(f[k])])
+            else:
+                new_faces.append([int(f[0]), int(f[1]), int(f[2])])
+
+        if new_vertices:
+            V = np.vstack([V, np.asarray(new_vertices, dtype=float)])
+        F = np.asarray(new_faces, dtype=np.int64)
+
+        if not added:
+            break
+        if len(F) >= max_faces_after_split:
+            break
+
+    return trimesh.Trimesh(vertices=V, faces=F, process=True)
+
+
+def _point_in_tri_2d_batch(P: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    if len(P) == 0:
+        return np.zeros(0, dtype=bool)
+    v0 = c - a
+    v1 = b - a
+    v2 = P - a
+    d00 = float(np.dot(v0, v0))
+    d01 = float(np.dot(v0, v1))
+    d11 = float(np.dot(v1, v1))
+    denom = d00 * d11 - d01 * d01
+    if abs(denom) < eps:
+        return np.zeros(len(P), dtype=bool)
+    d20 = np.sum(v2 * v0, axis=1)
+    d21 = np.sum(v2 * v1, axis=1)
+    v = (d11 * d20 - d01 * d21) / denom
+    w = (d00 * d21 - d01 * d20) / denom
+    u = 1.0 - v - w
+    return (u >= -eps) & (v >= -eps) & (w >= -eps)
+
+
+def _prepare_patch_overlap_cache(
+    mesh: trimesh.Trimesh,
+    patches: List[Any],
+    samples_per_face: int,
+) -> Dict[int, Dict[str, np.ndarray]]:
+    V = mesh.vertices
+    F = mesh.faces
+    cache: Dict[int, Dict[str, np.ndarray]] = {}
+
+    for p in patches:
+        pid = int(p.id if hasattr(p, "id") else p["id"])
+        face_indices = np.asarray(
+            p.face_indices if hasattr(p, "face_indices") else p["face_indices"],
+            dtype=np.int64,
+        )
+        if len(face_indices) == 0:
+            continue
+
+        n = unit(np.asarray(p.normal if hasattr(p, "normal") else p["normal"], float))
+        b = float(p.b if hasattr(p, "b") else p["b"])
+        c0 = np.asarray(p.centroid if hasattr(p, "centroid") else p["centroid"], float)
+        u, v, _ = basis_from_normal(n)
+
+        faces = F[face_indices]
+        tri = V[faces]
+        rel = tri - c0.reshape(1, 1, 3)
+        tri2d = np.empty((len(faces), 3, 2), dtype=float)
+        tri2d[:, :, 0] = rel @ u
+        tri2d[:, :, 1] = rel @ v
+        tri_bbox_min = tri2d.min(axis=1)
+        tri_bbox_max = tri2d.max(axis=1)
+        patch_bbox_min = tri_bbox_min.min(axis=0)
+        patch_bbox_max = tri_bbox_max.max(axis=0)
+
+        pts = sample_points_on_patch(mesh, face_indices, samples_per_face=samples_per_face)
+        if pts.ndim == 1:
+            pts = pts.reshape(-1, 3)
+
+        cache[pid] = {
+            "normal": n,
+            "b": np.asarray(b, dtype=float),
+            "centroid": c0,
+            "u": u,
+            "v": v,
+            "samples": pts,
+            "tri2d": tri2d,
+            "tri_bbox_min": tri_bbox_min,
+            "tri_bbox_max": tri_bbox_max,
+            "patch_bbox_min": patch_bbox_min,
+            "patch_bbox_max": patch_bbox_max,
+        }
+
+    return cache
+
+
+def _projection_overlap_ratio_cached(src_cache: Dict[str, np.ndarray], dst_cache: Dict[str, np.ndarray]) -> float:
+    pts = src_cache["samples"]
+    if len(pts) == 0:
+        return 0.0
+
+    n_i = src_cache["normal"]
+    n_j = dst_cache["normal"]
+    denom = -float(n_j @ n_i)
+    if abs(denom) < 1e-12:
+        return 0.0
+
+    b_j = float(dst_cache["b"])
+    t = (b_j - pts @ n_j) / denom
+    proj = pts + (t.reshape(-1, 1) * (-n_i))
+    rel = proj - dst_cache["centroid"].reshape(1, 3)
+    P2 = np.column_stack([rel @ dst_cache["u"], rel @ dst_cache["v"]])
+    if len(P2) == 0:
+        return 0.0
+
+    patch_box_mask = np.all(
+        (P2 >= dst_cache["patch_bbox_min"].reshape(1, 2))
+        & (P2 <= dst_cache["patch_bbox_max"].reshape(1, 2)),
+        axis=1,
+    )
+    if not np.any(patch_box_mask):
+        return 0.0
+
+    candidate_idx = np.where(patch_box_mask)[0]
+    P_local = P2[candidate_idx]
+    hit = np.zeros(len(P_local), dtype=bool)
+
+    tri2d = dst_cache["tri2d"]
+    tri_bbox_min = dst_cache["tri_bbox_min"]
+    tri_bbox_max = dst_cache["tri_bbox_max"]
+
+    for tri_id in range(len(tri2d)):
+        remaining = np.where(~hit)[0]
+        if len(remaining) == 0:
+            break
+
+        Q = P_local[remaining]
+        bbox_mask = np.all(
+            (Q >= tri_bbox_min[tri_id].reshape(1, 2))
+            & (Q <= tri_bbox_max[tri_id].reshape(1, 2)),
+            axis=1,
+        )
+        if not np.any(bbox_mask):
+            continue
+
+        rem_sel = remaining[np.where(bbox_mask)[0]]
+        inside = _point_in_tri_2d_batch(
+            P_local[rem_sel],
+            tri2d[tri_id, 0],
+            tri2d[tri_id, 1],
+            tri2d[tri_id, 2],
+        )
+        if np.any(inside):
+            hit[rem_sel[inside]] = True
+
+    return float(hit.sum()) / float(len(P2))
+
+
+def projection_overlap_ratio(
+    mesh: trimesh.Trimesh,
+    patch_i: dict,
+    patch_j: dict,
+    samples_per_face,
+) -> float:
+    """
+    Compatibility wrapper. For repeated evaluations, use the cache-based path.
+    """
+    p_i = dict(patch_i)
+    p_j = dict(patch_j)
+    p_i.setdefault("id", -1)
+    p_j.setdefault("id", -2)
+    cache = _prepare_patch_overlap_cache(mesh, [p_i, p_j], samples_per_face)
+    if -1 not in cache or -2 not in cache:
+        return 0.0
+    return _projection_overlap_ratio_cached(cache[-1], cache[-2])
+
+
+def score_patch_pair(
+    patch_a: PlanarPatch,
+    patch_b: PlanarPatch,
+    params: PatchPairParams,
+    mesh_for_overlap: trimesh.Trimesh,
+    com_mesh: np.ndarray,
+    bbox_diag: float,
+    overlap_cache: Optional[Dict[int, Dict[str, np.ndarray]]] = None,
+    precomputed_terms: Optional[Dict[str, float]] = None,
+) -> PatchPairCandidate:
+    n_a = unit(np.asarray(patch_a.normal, float))
+    n_b = unit(np.asarray(patch_b.normal, float))
+
+    c_a = np.asarray(patch_a.centroid, float)
+    c_b = np.asarray(patch_b.centroid, float)
+
+    if precomputed_terms is not None:
+        width = float(precomputed_terms["width"])
+        s_distance = float(precomputed_terms["distance"])
+        s_inertia = float(precomputed_terms["inertia"])
+        s_area = float(precomputed_terms["area"])
+        score = float(precomputed_terms["score"])
+    else:
+        width = float(np.linalg.norm(c_a - c_b))
+        if width <= 1e-12:
+            width = 1e-12
+        dist_a = point_line_distance(c_a, -n_a, c_b)
+        dist_b = point_line_distance(c_b, -n_b, c_a)
+        s_distance = 1.0 - (dist_a + dist_b) / max(float(bbox_diag), 1e-9)
+        direction_a = (c_b - c_a) / width
+        direction_b = -direction_a
+        dist_COM_a = point_line_distance(c_a, direction_a, com_mesh)
+        dist_COM_b = point_line_distance(c_b, direction_b, com_mesh)
+        s_inertia = 1.0 - max(dist_COM_a, dist_COM_b) / max(float(bbox_diag), 1e-9)
+        if patch_a.area > 0.0 and patch_b.area > 0.0:
+            s_area = min(patch_a.area / patch_b.area, patch_b.area / patch_a.area)
+        else:
+            s_area = 0.0
+        score = (
+            params.distance_weight * s_distance
+            + params.inertia_weight * s_inertia
+            + params.area_weight * s_area
+        )
+
+    if overlap_cache is not None:
+        src_a = overlap_cache.get(int(patch_a.id))
+        src_b = overlap_cache.get(int(patch_b.id))
+        if src_a is None or src_b is None:
+            s_overlap = 0.0
+        else:
+            overlap_a = _projection_overlap_ratio_cached(src_a, src_b)
+            overlap_b = _projection_overlap_ratio_cached(src_b, src_a)
+            s_overlap = overlap_a * overlap_b
+    else:
+        overlap_a = projection_overlap_ratio(mesh_for_overlap, asdict(patch_a), asdict(patch_b), params.samples_per_face)
+        overlap_b = projection_overlap_ratio(mesh_for_overlap, asdict(patch_b), asdict(patch_a), params.samples_per_face)
+        s_overlap = overlap_a * overlap_b
+
+    return PatchPairCandidate(
+        patch_i=patch_a.id,
+        patch_j=patch_b.id,
+        normal=n_a.tolist(),
+        width=width,
+        score=score,
+        terms={
+            "distance": float(s_distance),
+            "inertia": float(s_inertia),
+            "area": float(s_area),
+            "overlap": float(s_overlap),
+        },
+    )
+
+
+def compute_best_patch_pairs(
+    mesh_path: str,
+    mesh_max_triangles: int = 1000,
+    angle_deg: float = 7.0,
+    min_opening: float = 1.0,
+    max_opening: float = 140.0,
+    angle_tolerance_deg: float = 10.0,
+    top_k: int = 100,
+    prefilter_multiplier: int = 8,
+    min_prefilter_pool: int = 256,
+    min_area_ratio_prefilter: float = 0.03,
+    max_faces_after_split: int = 20000,
+) -> Dict[str, Any]:
+    mesh_filter, mesh_quad = load_uniform_mesh_with_open3d(mesh_path, target_triangles=mesh_max_triangles)
+
+    mesh_COM = mesh_quad.center_mass
+    mesh_bound = float(np.linalg.norm(mesh_quad.bounds[1] - mesh_quad.bounds[0]))
+    remesh = split_long_edges(mesh_filter, max_faces_after_split=max_faces_after_split)
+
+    patches = extract_planar_patches(remesh, angle_deg=angle_deg)
+    patches = orient_patch_normals(mesh_quad, remesh, patches)
+
+    params = PatchPairParams(
+        min_opening=min_opening,
+        max_opening=max_opening,
+        angle_tolerance_deg=angle_tolerance_deg,
+    )
+
+    cands: List[PatchPairCandidate] = []
+    if len(patches) < 2:
+        return {
+            "mesh_quad": mesh_quad,
+            "mesh_patches": remesh,
+            "num_patches": len(patches),
+            "num_candidates": 0,
+            "params": asdict(params),
+            "patches": [asdict(p) for p in patches],
+            "best": None,
+            "top_k": [],
+        }
+
+    normals = np.asarray([unit(np.asarray(p.normal, float)) for p in patches], dtype=float)
+    centroids = np.asarray([np.asarray(p.centroid, float) for p in patches], dtype=float)
+    areas = np.asarray([float(p.area) for p in patches], dtype=float)
+    n_patch = len(patches)
+
+    dvec = centroids[None, :, :] - centroids[:, None, :]
+    width = np.linalg.norm(dvec, axis=2)
+    safe_width = np.where(width > 1e-12, width, 1.0)
+    unit_d = dvec / safe_width[:, :, None]
+
+    upper_mask = np.triu(np.ones((n_patch, n_patch), dtype=bool), k=1)
+    cos_tol = math.cos(math.radians(params.angle_tolerance_deg))
+    opposite_mask = (normals @ normals.T) <= (-cos_tol)
+
+    dot_i = np.einsum("ijk,ik->ij", unit_d, normals)
+    dot_j = np.einsum("ijk,jk->ij", unit_d, normals)
+    facing_mask = (dot_i <= 0.0) & (dot_j >= 0.0)
+    width_mask = (width >= params.min_opening) & (width <= params.max_opening)
+
+    area_denom_i = np.maximum(areas[:, None], 1e-12)
+    area_denom_j = np.maximum(areas[None, :], 1e-12)
+    area_ratio = np.minimum(areas[:, None] / area_denom_j, areas[None, :] / area_denom_i)
+    area_mask = area_ratio >= float(min_area_ratio_prefilter)
+
+    ni = normals[:, None, :]
+    nj = normals[None, :, :]
+    t_a = np.sum(dvec * (-ni), axis=2)
+    dist_a = np.where(
+        t_a >= 0.0,
+        np.linalg.norm(dvec - t_a[:, :, None] * (-ni), axis=2),
+        width,
+    )
+
+    neg_dvec = -dvec
+    t_b = np.sum(neg_dvec * (-nj), axis=2)
+    dist_b = np.where(
+        t_b >= 0.0,
+        np.linalg.norm(neg_dvec - t_b[:, :, None] * (-nj), axis=2),
+        width,
+    )
+    s_distance = 1.0 - (dist_a + dist_b) / max(mesh_bound, 1e-9)
+
+    com_ref = np.asarray(mesh_COM, float).reshape(1, 1, 3)
+    ca_to_com = com_ref - centroids[:, None, :]
+    cb_to_com = com_ref - centroids[None, :, :]
+
+    dir_a = unit_d
+    dir_b = -unit_d
+
+    t_com_a = np.sum(ca_to_com * dir_a, axis=2)
+    dist_com_a = np.where(
+        t_com_a >= 0.0,
+        np.linalg.norm(ca_to_com - t_com_a[:, :, None] * dir_a, axis=2),
+        np.linalg.norm(ca_to_com, axis=2),
+    )
+    t_com_b = np.sum(cb_to_com * dir_b, axis=2)
+    dist_com_b = np.where(
+        t_com_b >= 0.0,
+        np.linalg.norm(cb_to_com - t_com_b[:, :, None] * dir_b, axis=2),
+        np.linalg.norm(cb_to_com, axis=2),
+    )
+
+    s_inertia = 1.0 - np.maximum(dist_com_a, dist_com_b) / max(mesh_bound, 1e-9)
+    quick_score = (
+        params.distance_weight * s_distance
+        + params.inertia_weight * s_inertia
+        + params.area_weight * area_ratio
+    )
+
+    valid_mask = upper_mask & opposite_mask & facing_mask & width_mask & area_mask & (quick_score > 0.0)
+    pair_idx = np.argwhere(valid_mask)
+
+    if len(pair_idx) == 0:
+        return {
+            "mesh_quad": mesh_quad,
+            "mesh_patches": remesh,
+            "num_patches": len(patches),
+            "num_candidates": 0,
+            "params": asdict(params),
+            "patches": [asdict(p) for p in patches],
+            "best": None,
+            "top_k": [],
+        }
+
+    pair_scores = quick_score[pair_idx[:, 0], pair_idx[:, 1]]
+    pool_size = max(int(top_k * max(prefilter_multiplier, 1)), int(min_prefilter_pool))
+    if len(pair_idx) > pool_size:
+        sel = np.argpartition(-pair_scores, pool_size - 1)[:pool_size]
+        pair_idx = pair_idx[sel]
+        pair_scores = pair_scores[sel]
+
+    order = np.argsort(-pair_scores)
+    pair_idx = pair_idx[order]
+
+    overlap_cache = _prepare_patch_overlap_cache(remesh, patches, params.samples_per_face)
+
+    sd_vals = s_distance[pair_idx[:, 0], pair_idx[:, 1]]
+    si_vals = s_inertia[pair_idx[:, 0], pair_idx[:, 1]]
+    sa_vals = area_ratio[pair_idx[:, 0], pair_idx[:, 1]]
+    wd_vals = width[pair_idx[:, 0], pair_idx[:, 1]]
+    qs_vals = quick_score[pair_idx[:, 0], pair_idx[:, 1]]
+
+    for k in range(len(pair_idx)):
+        i = int(pair_idx[k, 0])
+        j = int(pair_idx[k, 1])
+
+        cand = score_patch_pair(
+            patches[i],
+            patches[j],
+            params,
+            remesh,
+            mesh_COM,
+            mesh_bound,
+            overlap_cache=overlap_cache,
+            precomputed_terms={
+                "distance": float(sd_vals[k]),
+                "inertia": float(si_vals[k]),
+                "area": float(sa_vals[k]),
+                "width": float(wd_vals[k]),
+                "score": float(qs_vals[k]),
+            },
+        )
+
+        if cand.terms["overlap"] <= 0.0:
+            continue
+        if cand.score <= 0.0:
+            continue
+        cands.append(cand)
+
+    cands.sort(key=lambda c: c.score, reverse=True)
+
+    return {
+        "mesh_quad": mesh_quad,
+        "mesh_patches": remesh,
+        "num_patches": len(patches),
+        "num_candidates": len(cands),
+        "params": asdict(params),
+        "patches": [asdict(p) for p in patches],
+        "best": asdict(cands[0]) if cands else None,
+        "top_k": [asdict(c) for c in cands[:top_k]] if cands else [],
+    }
+
+
+def _precompute_face_centroids(mesh: trimesh.Trimesh) -> np.ndarray:
+    if len(mesh.faces) == 0:
+        return np.zeros((0, 3), dtype=float)
+    return mesh.vertices[mesh.faces].mean(axis=1)
+
+
+def _best_face_matches(
+    face_centroids: np.ndarray,
+    face_i_idx: np.ndarray,
+    face_j_idx: np.ndarray,
+    n_i: np.ndarray,
+    n_j: np.ndarray,
+    max_face_trials_per_pair: int,
+) -> List[Tuple[int, int, np.ndarray, np.ndarray]]:
+    if len(face_i_idx) == 0 or len(face_j_idx) == 0:
+        return []
+
+    ci_all = face_centroids[face_i_idx]
+    cj_all = face_centroids[face_j_idx]
+    d = cj_all[None, :, :] - ci_all[:, None, :]
+    nd = np.linalg.norm(d, axis=2)
+    valid = nd > 1e-12
+
+    d_hat = np.zeros_like(d)
+    d_hat[valid] = d[valid] / nd[valid, None]
+    score = np.abs(np.sum(d_hat * (-n_i).reshape(1, 1, 3), axis=2)) * np.abs(
+        np.sum((-d_hat) * n_j.reshape(1, 1, 3), axis=2)
+    )
+    score[~valid] = -1.0
+
+    best_j_local = np.argmax(score, axis=1)
+    best_score = score[np.arange(len(face_i_idx)), best_j_local]
+    order = np.argsort(-best_score)
+    if max_face_trials_per_pair > 0:
+        order = order[:max_face_trials_per_pair]
+
+    out: List[Tuple[int, int, np.ndarray, np.ndarray]] = []
+    for li in order:
+        if best_score[li] <= 0.0:
+            continue
+        fi = int(face_i_idx[li])
+        lj = int(best_j_local[li])
+        fj = int(face_j_idx[lj])
+        out.append((fi, fj, ci_all[li], cj_all[lj]))
+    return out
+
+
+def _collision_broadphase_reject(
+    geom: trimesh.Trimesh,
+    mesh_bounds: np.ndarray,
+    mesh_center: np.ndarray,
+    mesh_radius: float,
+) -> bool:
+    gmin, gmax = geom.bounds
+    if np.any(gmax < mesh_bounds[0]) or np.any(gmin > mesh_bounds[1]):
+        return True
+    gcenter = 0.5 * (gmin + gmax)
+    gradius = 0.5 * float(np.linalg.norm(gmax - gmin))
+    return float(np.linalg.norm(gcenter - mesh_center)) > float(mesh_radius + gradius)
+
+
+def check_gripper_feasibility_faces_with_yaw(
+    result: dict,
+    pad_w: float = PadParams.pad_w,
+    pad_h: float = PadParams.pad_h,
+    pad_d: float = PadParams.pad_d,
+    clearance_out: float = 10.0,
+    yaw_grid_deg = [0, 90],
+    use_mesh: str = "mesh_patches",
+    check_mesh: str = "mesh_quad",
+    max_face_trials_per_pair: int = 40,
+    max_feasible_per_pair: int = 4,
+    use_broadphase: bool = True,
+):
+    mesh = result[use_mesh]
+    mesh_ch = result[check_mesh]
+    patches = {p["id"]: p for p in result["patches"]}
+    pairs = result.get("top_k", [])
+    face_centroids = _precompute_face_centroids(mesh)
+    patch_faces = {pid: np.asarray(p["face_indices"], dtype=np.int64) for pid, p in patches.items()}
+
+    try:
+        com = mesh_ch.center_mass
+    except Exception:
+        com = 0.5 * (mesh_ch.bounds[0] + mesh_ch.bounds[1])
+
+    cm = trimesh.collision.CollisionManager()
+    cm.add_object("part", mesh_ch)
+
+    mesh_bounds = mesh_ch.bounds
+    mesh_center = 0.5 * (mesh_bounds[0] + mesh_bounds[1])
+    mesh_radius = 0.5 * float(np.linalg.norm(mesh_bounds[1] - mesh_bounds[0]))
+
+    reports = []
+    dist_criteria = float(min(pad_w, pad_h) / 5.0)
+
+    for k, cand in enumerate(pairs):
+        pid_i, pid_j = cand["patch_i"], cand["patch_j"]
+        if pid_i not in patches or pid_j not in patches:
+            reports.append(dict(pair_index=k, feasible=False))
+            continue
+
+        p_i = patches[pid_i]
+        p_j = patches[pid_j]
+        n_i = unit(np.asarray(p_i["normal"], float))
+        n_j = unit(np.asarray(p_j["normal"], float))
+
+        reports_for_this_pair = []
+        matches = _best_face_matches(
+            face_centroids,
+            patch_faces[pid_i],
+            patch_faces[pid_j],
+            n_i,
+            n_j,
+            max_face_trials_per_pair=max_face_trials_per_pair,
+        )
+
+        for f_i, best_j, ci, best_cj in matches:
+            alignment_dist_i = point_line_distance(ci, -n_i, best_cj)
+            alignment_dist_j = point_line_distance(best_cj, -n_j, ci)
+            if alignment_dist_i > dist_criteria or alignment_dist_j > dist_criteria:
+                continue
+
+            for yaw in yaw_grid_deg:
+                box_i = make_rot_pad_box_at_patch(
+                    {"centroid": ci, "normal": n_i},
+                    pad_w,
+                    pad_h,
+                    pad_d,
+                    clearance_out,
+                    yaw_deg=yaw,
+                )
+                box_j = make_rot_pad_box_at_patch(
+                    {"centroid": best_cj, "normal": n_j},
+                    pad_w,
+                    pad_h,
+                    pad_d,
+                    clearance_out,
+                    yaw_deg=-yaw,
+                )
+
+                if use_broadphase and _collision_broadphase_reject(box_i, mesh_bounds, mesh_center, mesh_radius):
+                    coll_i = False
+                else:
+                    coll_i = cm.in_collision_single(box_i)
+                if coll_i:
+                    continue
+
+                if use_broadphase and _collision_broadphase_reject(box_j, mesh_bounds, mesh_center, mesh_radius):
+                    coll_j = False
+                else:
+                    coll_j = cm.in_collision_single(box_j)
+                if coll_j:
+                    continue
+
+                midpoint = 0.5 * (ci + best_cj)
+                current_dist = float(np.linalg.norm(midpoint - com))
+                Fi = -n_i
+                Fj = -n_j
+                tau = np.cross(ci - com, Fi) + np.cross(best_cj - com, Fj)
+                current_moment = float(np.linalg.norm(tau))
+
+                reports_for_this_pair.append(
+                    dict(
+                        pair_index=k,
+                        patch_i=pid_i,
+                        patch_j=pid_j,
+                        face_i=f_i,
+                        face_j=best_j,
+                        feasible=True,
+                        feasible_yaw=yaw,
+                        moment=current_moment,
+                        dist=current_dist,
+                    )
+                )
+
+                if len(reports_for_this_pair) >= max_feasible_per_pair:
+                    break
+            if len(reports_for_this_pair) >= max_feasible_per_pair:
+                break
+
+        if not reports_for_this_pair:
+            reports.append(dict(pair_index=k, patch_i=pid_i, patch_j=pid_j, feasible=False))
+        else:
+            reports.extend(reports_for_this_pair)
+
+    reports_sorted = sorted(
+        [r for r in reports if r.get("feasible")],
+        key=lambda r: (-r.get("dist", float("inf")), -r.get("moment", float("inf"))),
+    )
+    return reports_sorted
+
+
+def check_gripper_feasibility_faces_with_rotation(
+    result: dict,
+    pad_w: float = PadParams.pad_w,
+    pad_h: float = PadParams.pad_h,
+    pad_d: float = PadParams.pad_d,
+    clearance_out: float = 10.0,
+    use_mesh: str = "mesh_patches",
+    check_mesh: str = "mesh_quad",
+    max_face_trials_per_pair: int = 40,
+    max_feasible_per_pair: int = 4,
+    use_broadphase: bool = True,
+):
+    mesh = result[use_mesh]
+    mesh_ch = result[check_mesh]
+    patches = {p["id"]: p for p in result["patches"]}
+    pairs = result.get("top_k", [])
+    face_centroids = _precompute_face_centroids(mesh)
+    patch_faces = {pid: np.asarray(p["face_indices"], dtype=np.int64) for pid, p in patches.items()}
+
+    try:
+        com = mesh_ch.center_mass
+    except Exception:
+        com = 0.5 * (mesh_ch.bounds[0] + mesh_ch.bounds[1])
+
+    cm = trimesh.collision.CollisionManager()
+    cm.add_object("part", mesh_ch)
+
+    mesh_bounds = mesh_ch.bounds
+    mesh_center = 0.5 * (mesh_bounds[0] + mesh_bounds[1])
+    mesh_radius = 0.5 * float(np.linalg.norm(mesh_bounds[1] - mesh_bounds[0]))
+
+    reports = []
+    dist_criteria = float(min(pad_w, pad_h) / 5.0)
+
+    for k, cand in enumerate(pairs):
+        pid_i, pid_j = cand["patch_i"], cand["patch_j"]
+        if pid_i not in patches or pid_j not in patches:
+            reports.append(dict(pair_index=k, feasible=False))
+            continue
+
+        p_i = patches[pid_i]
+        p_j = patches[pid_j]
+        n_i = unit(np.asarray(p_i["normal"], float))
+        n_j = unit(np.asarray(p_j["normal"], float))
+
+        feasible_for_pair = 0
+        matches = _best_face_matches(
+            face_centroids,
+            patch_faces[pid_i],
+            patch_faces[pid_j],
+            n_i,
+            n_j,
+            max_face_trials_per_pair=max_face_trials_per_pair,
+        )
+
+        for f_i, best_j, ci, best_cj in matches:
+            alignment_dist_i = point_line_distance(ci, -n_i, best_cj)
+            alignment_dist_j = point_line_distance(best_cj, -n_j, ci)
+            if alignment_dist_i > dist_criteria or alignment_dist_j > dist_criteria:
+                continue
+
+            cyl_i = make_pad_cylinder_at_patch({"centroid": ci, "normal": n_i}, pad_w / 2, pad_h / 2, pad_d, clearance_out)
+            cyl_j = make_pad_cylinder_at_patch({"centroid": best_cj, "normal": n_j}, pad_w / 2, pad_h / 2, pad_d, clearance_out)
+
+            if use_broadphase and _collision_broadphase_reject(cyl_i, mesh_bounds, mesh_center, mesh_radius):
+                coll_i = False
+            else:
+                coll_i = cm.in_collision_single(cyl_i)
+            if coll_i:
+                continue
+
+            if use_broadphase and _collision_broadphase_reject(cyl_j, mesh_bounds, mesh_center, mesh_radius):
+                coll_j = False
+            else:
+                coll_j = cm.in_collision_single(cyl_j)
+            if coll_j:
+                continue
+
+            midpoint = 0.5 * (ci + best_cj)
+            current_dist = float(np.linalg.norm(midpoint - com))
+            Fi = -n_i
+            Fj = -n_j
+            tau = np.cross(ci - com, Fi) + np.cross(best_cj - com, Fj)
+            current_moment = float(np.linalg.norm(tau))
+
+            reports.append(
+                dict(
+                    pair_index=k,
+                    patch_i=pid_i,
+                    patch_j=pid_j,
+                    face_i=f_i,
+                    face_j=best_j,
+                    dist=current_dist,
+                    moment=current_moment,
+                    feasible=True,
+                )
+            )
+
+            feasible_for_pair += 1
+            if feasible_for_pair >= max_feasible_per_pair:
+                break
+
+    reports_sorted = sorted(
+        [r for r in reports if r.get("feasible")],
+        key=lambda r: (r.get("dist", float("inf")), r.get("moment", float("inf"))),
+    )
+    return reports_sorted
+
 
 # --------------------------
 # Grasping metric: Epsilon-Quality metric 
