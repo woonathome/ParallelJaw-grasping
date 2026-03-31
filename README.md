@@ -1,20 +1,21 @@
 # Grasping_Face
 
-`Grasping_Face` computes feasible grasp pairs for a parallel-jaw gripper (AG145-style parameters) from a CAD mesh (`.obj` / `.ply`) using geometric analysis.
+`Grasping_Face` computes grasp candidates for a parallel-jaw gripper (AG145-style pad params) from CAD meshes (`.obj` / `.ply`) using geometric analysis.
 
-Main implementation:
+Main files:
 - [grasping.py](./Grasping_Face/grasping.py)
 - [visualize_grasping.py](./Grasping_Face/visualize_grasping.py)
 
-## 1. What This Module Does
+## 1. Pipeline (Current)
 
-Pipeline overview:
+The core flow is:
 
-1. Load and simplify the input mesh.
-2. Extract planar patches by grouping adjacent faces.
-3. Build and score opposite-facing patch-pair candidates.
-4. Run pad-volume collision checks to keep physically feasible face pairs.
-5. Optionally compute gripper pose and EE delta pose for robot execution.
+1. Mesh preprocessing and simplification.
+2. Patch extraction (planar region growing).
+3. Patch pair filtering/scoring/ranking.
+4. Gripper pad collision check on face-level contact candidates.
+
+This order is preserved in the current optimized implementation.
 
 ## 2. Dependencies
 
@@ -22,201 +23,195 @@ Pipeline overview:
 pip install numpy scipy trimesh open3d plotly
 ```
 
-`check_gripper_feasibility_*` uses `trimesh.collision.CollisionManager`; depending on your environment, an additional collision backend may be required.
+`check_gripper_feasibility_*` uses `trimesh.collision.CollisionManager`.  
+Depending on your system, an extra collision backend (for `python-fcl`) may be required.
 
 ## 3. Quick Start
 
 ```python
 import Grasping_Face.grasping as gf
 
-mesh_path = "./models_target/models_cad/custom_ind/bracket_1.obj"  # .ply is also supported
+mesh_path = "./models_target/models_cad/custom_ind/bracket_1.obj"
 
 result = gf.compute_best_patch_pairs(
     mesh_path=mesh_path,
     mesh_max_triangles=1500,
-    angle_deg=10,
+    angle_deg=10.0,
     min_opening=1.0,
     max_opening=140.0,
-    angle_tolerance_deg=10,
+    angle_tolerance_deg=10.0,
     top_k=500,
+    pair_sort_key="score",      # "score" or "epsilon"
+    max_faces_after_split=25000,
 )
 
-# Option A: Yaw-aware OBB pad collision check (default yaw grid: [0, 90])
-reports = gf.check_gripper_feasibility_faces_with_yaw(result)
-
-# Option B: Cylindrical swept-volume collision check (coarser but simple)
-# reports = gf.check_gripper_feasibility_faces_with_rotation(result)
+reports = gf.check_gripper_feasibility_faces_with_yaw(
+    result,
+    max_face_trials_per_pair=40,
+    max_feasible_per_pair=4,
+    sort_key="dist_moment",     # "dist_moment" or "epsilon"
+)
 
 print(result["num_patches"], result["num_candidates"], len(reports))
 ```
 
-## 4. Core Data Structures
+## 4. Data Structures
 
 ### `PlanarPatch`
 
-- `id`: Patch index
-- `face_indices`: Face indices belonging to the patch
-- `normal`, `b`: Plane equation `n·x = b`
-- `area`: Patch area
-- `centroid`: Patch bbox center
-- `centroid_check`: Mean vertex center (used for checks)
+- `id`: patch index
+- `face_indices`: face indices in this patch
+- `normal`, `b`: plane equation `n dot x = b`
+- `area`: patch area
+- `centroid`: patch AABB center
+- `centroid_check`: mean vertex center
 
 ### `PatchPairCandidate`
 
-- `patch_i`, `patch_j`: Patch IDs
-- `normal`: Normal of `patch_i`
-- `width`: Distance between patch centroids (opening candidate)
-- `score`: Final weighted score
-- `terms`: `distance`, `inertia`, `area`, `overlap`
+- `patch_i`, `patch_j`: patch IDs
+- `normal`: normal of `patch_i`
+- `width`: centroid distance (opening candidate)
+- `score`: weighted geometric score
+- `terms`: `distance`, `inertia`, `area`, `overlap` (+ optional `epsilon`)
 
-### `PadParams`
+### `PadParams` (default)
 
-Default values(Robotiq AG145-105 Gripper):
 - `pad_w = 34.0`
 - `pad_h = 21.0`
 - `pad_d = 7.0`
 - `mu = 0.8`
 
-Units are assumed to be **millimeters**. Input mesh scale should match this assumption.
+Units are assumed to be millimeters.
 
-## 5. Main Function Details
+## 5. Main Functions (Updated)
+
+### `split_long_edges(mesh, max_iter=100, max_faces_after_split=20000, max_len=None)`
+
+- Splits long edges iteratively.
+- Includes a face-count guard (`max_faces_after_split`) to prevent mesh explosion.
+- If this cap is too low, planar objects may produce fewer patch/face combinations.
 
 ### `compute_best_patch_pairs(...)`
 
-Main entry point of the grasp candidate pipeline.
+Current arguments include:
 
-Inputs:
-- `mesh_path`
-- mesh simplification target (`mesh_max_triangles`)
-- patch merge angle (`angle_deg`)
-- opening bounds (`min_opening`, `max_opening`)
-- opposite-normal tolerance (`angle_tolerance_deg`)
-- number of returned candidates (`top_k`)
+- geometry: `mesh_path`, `mesh_max_triangles`, `angle_deg`, `min_opening`, `max_opening`, `angle_tolerance_deg`, `top_k`
+- speed/coverage controls:
+  - `prefilter_multiplier=8`
+  - `min_prefilter_pool=256`
+  - `min_area_ratio_prefilter=0.03`
+  - `max_faces_after_split=20000`
+- ranking:
+  - `pair_sort_key="score"` or `"epsilon"`
+  - `epsilon_mu`, `epsilon_k` (used when `pair_sort_key="epsilon"`)
 
-Processing steps:
-1. `load_uniform_mesh_with_open3d`: mesh cleanup + quadric decimation.
-2. `split_long_edges`: subdivide long triangles.
-3. `extract_planar_patches`: region-grow planar patches.
-4. `orient_patch_normals`: flip normals to outward directions.
-5. Pair filtering:
-   - Nearly opposite normals
-   - Facing each other
-   - Opening range check
-   - Positive overlap and score
-6. Candidate scoring via `score_patch_pair`.
+Processing:
 
-Returns a `result` dict containing meshes, patches, and ranked candidates.
-
-### `extract_planar_patches(mesh, angle_deg=15.0)`
-
-Extracts planar regions from adjacent triangle faces.
-
-- Uses face adjacency graph and BFS-like region growing.
-- Neighbor faces are merged when normal-angle condition passes.
-- Re-fits patch plane by SVD (`plane_from_points`).
-- Outputs `PlanarPatch` list with area/plane/centroid metadata.
-
-### `orient_patch_normals(mesh_quad, mesh_patches, patches)`
-
-Makes patch normals consistently outward.
-
-- Tests points shifted along `+n` and `-n` using `mesh_quad.contains`.
-- If the current direction points inward, flips the normal.
-- Stabilizes downstream "opposite-facing pair" checks.
+1. `load_uniform_mesh_with_open3d` (cleanup + decimation).
+2. `split_long_edges` (with face cap).
+3. `extract_planar_patches` and `orient_patch_normals`.
+4. Vectorized pair prefilter (`opposite`, `facing`, opening, area-ratio, quick score).
+5. Prefilter pool truncation (`prefilter_multiplier`, `min_prefilter_pool`).
+6. Detailed scoring via `score_patch_pair` + overlap check.
+7. Final sort:
+   - `score`: descending
+   - `epsilon`: descending epsilon, then score
 
 ### `score_patch_pair(...)`
 
-Computes geometric quality terms for a patch pair:
+Computes:
 
-- `overlap`: bidirectional projection overlap ratio between patches
-- `distance`: alignment quality between patch normals and opposite centroids
-- `inertia`: distance from centroid-connection line to mesh COM
-- `area`: area balance ratio between two patches
+- `distance`: centroid-line alignment term
+- `inertia`: COM-line distance term
+- `area`: patch-area balance
+- `overlap`: bidirectional projection overlap
 
-Current final score uses weighted sum of:
-- `distance`, `inertia`, `area`
+Final `score` uses the weighted sum of `distance + inertia + area`.  
+`overlap` is still computed and used as a validity filter (`overlap > 0`).
 
-`overlap` is still computed and used as a filtering condition.
+### `check_gripper_feasibility_faces_with_yaw(...)`
 
-### `check_gripper_feasibility_faces_with_yaw(result, ...)`
+Face-level feasibility with yaw-aware pad OBB collision:
 
-Face-level feasibility check with yaw-aware pad OBB collision testing.
+- Finds face matches via `_best_face_matches` (best face-j per face-i, then top-N).
+- `max_face_trials_per_pair` limits tested face pairs (default `40`).
+- `max_feasible_per_pair` limits accepted reports per patch pair (default `4`).
+- Uses optional broad-phase reject before exact collision (`use_broadphase=True`).
+- Sort options:
+  - `sort_key="dist_moment"`: ascending `(dist, moment)` (smaller is better)
+  - `sort_key="epsilon"`: descending `epsilon` (larger is better), then `(dist, moment)`
 
-- For each patch pair candidate, finds best aligned face pair.
-- Rejects badly misaligned face-to-face geometry.
-- Builds pad OBBs with `make_rot_pad_box_at_patch`.
-- Tests collision against check mesh.
-- Keeps feasible pairs and records:
-  - `dist`: midpoint-to-COM distance
-  - `moment`: simple torque metric around COM
-  - `feasible_yaw`
+### `check_gripper_feasibility_faces_with_rotation(...)`
 
-### `check_gripper_feasibility_faces_with_rotation(result, ...)`
+Alternative feasibility path with cylindrical pads:
 
-Alternative feasibility check using cylindrical swept-volume approximation.
-
+- Same face-pair preselection and limits as yaw version.
 - Uses `make_pad_cylinder_at_patch`.
-- Similar filtering flow with simpler shape model.
-- Typically faster/coarser than yaw-aware OBB checks.
+- Supports the same sort behavior (`dist_moment` / `epsilon`).
 
-### `build_gripper_pose_obj(...)` / `build_gripper_pose_obj_OPE(...)`
+### Pose / Robot Utilities
 
-Build object-frame gripper pose `H_OG` from two contact patches.
+- `build_gripper_pose_obj(...)`
+- `build_gripper_pose_obj_OPE(...)`
+- `ee_delta_pose_des(...)`
 
-- Defines closing axis from patch normal difference.
-- Applies yaw around closing frame.
-- Applies stroke-dependent origin offset via `origin_offset_from_stroke`.
-- `build_gripper_pose_obj_OPE` additionally uses `H_OC` to enforce camera-frame directional constraints.
+These convert feasible contact pairs into object-frame gripper pose and EE delta transforms.
 
-### `ee_delta_pose_des(H_OC, H_OG)`
+### Quality Metrics
 
-Computes desired EE relative motion transform for robot execution.
+- `calculate_epsilon_quality(...)`
+- `calculate_squeeze_epsilon_quality(...)`
 
-Outputs:
-- `H_EdEn`: desired EE pose relative to current EE
-- `H_OdEn`
+`epsilon` is now available as a sorting option in patch-pair ranking and feasibility report ranking.
 
-Uses fixed internal calibration transforms (`H_GnEn`, `H_GnCn`).
-
-### `calculate_epsilon_quality(...)` / `calculate_squeeze_epsilon_quality(...)`
-
-Wrench-space force-closure quality utilities:
-
-- `calculate_epsilon_quality`: point-contact-based epsilon quality
-- `calculate_squeeze_epsilon_quality`: squeezed pad contact-region-based epsilon quality
-
-These are primarily analysis/experimental metrics and are not the main ranking criterion in the default candidate pipeline.
-
-## 6. Output Schemas
+## 6. Output Schema
 
 ### `result = compute_best_patch_pairs(...)`
 
-Important keys:
-- `mesh_quad`
-- `mesh_patches`
-- `num_patches`
-- `num_candidates`
-- `params`
-- `patches`
-- `best`
-- `top_k`
+Key fields:
 
-### `reports = check_gripper_feasibility_* (result)`
+- `mesh_quad`, `mesh_patches`
+- `num_patches`, `num_candidates`
+- `params`, `patches`
+- `best`, `top_k`
 
-Each feasible report may include:
-- `pair_index`, `patch_i`, `patch_j`
-- `face_i`, `face_j`
-- `feasible`
-- `feasible_yaw` (`with_yaw` version)
-- `dist`, `moment`
+### `reports = check_gripper_feasibility_* (...)`
 
-## 7. Visualization Helpers
+Feasible item fields:
 
-From `visualize_grasping.py`:
+- common: `pair_index`, `patch_i`, `patch_j`, `face_i`, `face_j`, `dist`, `moment`, `feasible`
+- yaw version adds: `feasible_yaw`
+- epsilon sort mode adds: `epsilon`
+
+## 7. Visualization (`visualize_grasping.py`)
+
+Main entry points:
 
 - `visualize_merged_patches_plotly(result)`
-- `visualize_pairs_centroid_lines(result)`
-- `visualize_feasible_pairs_*`
-- `visualize_frames(...)`
+- `visualize_pairs_centroid_lines(result, max_pairs_show=200, ...)`
+- `visualize_feasible_pairs_pads(..., max_reports_show=300, ...)`
+- `visualize_feasible_pairs_with_yaw(..., max_reports_show=300, ...)`
+- `visualize_feasible_pairs_with_cylinder(..., max_reports_show=300, ...)`
+- `visualize_feasible_pairs(..., max_reports_show=300, ...)`
+- `visualize_feasible_pairs_pads_gripper(..., max_reports_show=300, ...)`
 
-These are useful for inspecting extracted patches, candidate pairs, feasible contacts, and frame transforms.
+Visualization functions may display only a prefix of candidates/reports by default.
+
+## 8. Batch Result Export (Notebook)
+
+`GraspingTest.ipynb` includes batch execution for custom + BOP CAD datasets and saves HTML outputs under:
+
+- `./Grasping_Results/<dataset_name>/`
+
+Typical outputs include patch normals, patch-pair lines, and feasible grasp visualizations.
+
+## 9. Coverage vs Speed Tuning
+
+If planar-heavy objects seem to lose too many pairs, increase coverage by tuning:
+
+- `max_faces_after_split` (more remesh subdivision)
+- `min_area_ratio_prefilter` (smaller to keep more asymmetric pairs)
+- `prefilter_multiplier` / `min_prefilter_pool` (larger candidate pool)
+- `max_face_trials_per_pair` (more face pairs tested per patch pair)
+- `max_feasible_per_pair` (more feasible contacts kept per patch pair)
+- visualization caps: `max_pairs_show`, `max_reports_show`
