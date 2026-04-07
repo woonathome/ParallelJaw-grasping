@@ -85,7 +85,7 @@ def load_uniform_mesh_with_open3d(path, target_triangles=500, min_area=0.001): #
     mesh_filter = trimesh.Trimesh(vertices=V, faces=F, process=True)
     return mesh_filter, mesh_quad
 
-def split_long_edges(mesh: trimesh.Trimesh, max_iter: int = 100):
+def _legacy_split_long_edges(mesh: trimesh.Trimesh, max_iter: int = 100):
     """
     삼각형별 긴 edge를 기준으로 반복 subdivide
     - mesh: trimesh.Trimesh
@@ -280,7 +280,7 @@ def sample_points_on_patch(mesh: trimesh.Trimesh, face_idx, samples_per_face):
             P.append(p)
     return np.asarray(P, float)
 
-def projection_overlap_ratio(mesh: trimesh.Trimesh,
+def _legacy_projection_overlap_ratio(mesh: trimesh.Trimesh,
                               patch_i: dict, patch_j: dict,
                               samples_per_face) -> float:
 
@@ -537,7 +537,7 @@ def orient_patch_normals(mesh_quad: trimesh.Trimesh, mesh_patches: trimesh.Trime
 # --------------------------
 # Patch Pair scoring
 # --------------------------
-def score_patch_pair(patch_a: PlanarPatch,
+def _legacy_score_patch_pair(patch_a: PlanarPatch,
                      patch_b: PlanarPatch,
                      params: PatchPairParams,
                      mesh_for_overlap: trimesh.Trimesh,
@@ -615,7 +615,7 @@ def score_patch_pair(patch_a: PlanarPatch,
 # --------------------------
 # Main API
 # --------------------------
-def compute_best_patch_pairs(
+def _legacy_compute_best_patch_pairs_v1(
     mesh_path: str,
     mesh_max_triangles: int = 1000,         # 원본 mesh 삼각형 개수
     angle_deg: float = 7.0,                # 패치 병합 허용 각도 (↑면 패치 수 ↓)
@@ -696,7 +696,7 @@ def compute_best_patch_pairs(
 
 
 # --- yaw 스윕하여 feasibility 검사(+ 모멘트 계산/정렬) ---
-def check_gripper_feasibility_faces_with_yaw(
+def _legacy_check_gripper_feasibility_faces_with_yaw_v1(
     result: dict,
     pad_w: float = PadParams.pad_w,
     pad_h: float = PadParams.pad_h,
@@ -816,7 +816,7 @@ def check_gripper_feasibility_faces_with_yaw(
     return reports_sorted
 
 
-def check_gripper_feasibility_faces_with_rotation(
+def _legacy_check_gripper_feasibility_faces_with_rotation_v1(
     result: dict,
     pad_w: float = PadParams.pad_w,
     pad_h: float = PadParams.pad_h,
@@ -1205,7 +1205,13 @@ def compute_best_patch_pairs(
     min_prefilter_pool: int = 256,
     min_area_ratio_prefilter: float = 0.03,
     max_faces_after_split: int = 20000,
+    pair_sort_key: str = "score",
+    epsilon_mu: float = PadParams.mu,
+    epsilon_k: int = 16,
 ) -> Dict[str, Any]:
+    if pair_sort_key not in ("score", "epsilon"):
+        raise ValueError("pair_sort_key must be one of: 'score', 'epsilon'")
+
     mesh_filter, mesh_quad = load_uniform_mesh_with_open3d(mesh_path, target_triangles=mesh_max_triangles)
 
     mesh_COM = mesh_quad.center_mass
@@ -1361,9 +1367,25 @@ def compute_best_patch_pairs(
             continue
         if cand.score <= 0.0:
             continue
+
+        if pair_sort_key == "epsilon":
+            eps = calculate_epsilon_quality(
+                np.asarray(patches[i].centroid, float),
+                np.asarray(patches[i].normal, float),
+                np.asarray(patches[j].centroid, float),
+                np.asarray(patches[j].normal, float),
+                np.asarray(mesh_COM, float),
+                mu=epsilon_mu,
+                k=epsilon_k,
+            )
+            cand.terms["epsilon"] = float(eps)
+
         cands.append(cand)
 
-    cands.sort(key=lambda c: c.score, reverse=True)
+    if pair_sort_key == "epsilon":
+        cands.sort(key=lambda c: (c.terms.get("epsilon", 0.0), c.score), reverse=True)
+    else:
+        cands.sort(key=lambda c: c.score, reverse=True)
 
     return {
         "mesh_quad": mesh_quad,
@@ -1450,7 +1472,13 @@ def check_gripper_feasibility_faces_with_yaw(
     max_face_trials_per_pair: int = 40,
     max_feasible_per_pair: int = 4,
     use_broadphase: bool = True,
+    sort_key: str = "dist_moment",
+    epsilon_mu: float = PadParams.mu,
+    epsilon_k: int = 16,
 ):
+    if sort_key not in ("dist_moment", "epsilon"):
+        raise ValueError("sort_key must be one of: 'dist_moment', 'epsilon'")
+
     mesh = result[use_mesh]
     mesh_ch = result[check_mesh]
     patches = {p["id"]: p for p in result["patches"]}
@@ -1552,6 +1580,18 @@ def check_gripper_feasibility_faces_with_yaw(
                         dist=current_dist,
                     )
                 )
+                if sort_key == "epsilon":
+                    reports_for_this_pair[-1]["epsilon"] = float(
+                        calculate_epsilon_quality(
+                            ci,
+                            n_i,
+                            best_cj,
+                            n_j,
+                            np.asarray(com, float),
+                            mu=epsilon_mu,
+                            k=epsilon_k,
+                        )
+                    )
 
                 if len(reports_for_this_pair) >= max_feasible_per_pair:
                     break
@@ -1563,10 +1603,21 @@ def check_gripper_feasibility_faces_with_yaw(
         else:
             reports.extend(reports_for_this_pair)
 
-    reports_sorted = sorted(
-        [r for r in reports if r.get("feasible")],
-        key=lambda r: (-r.get("dist", float("inf")), -r.get("moment", float("inf"))),
-    )
+    feasible_reports = [r for r in reports if r.get("feasible")]
+    if sort_key == "epsilon":
+        reports_sorted = sorted(
+            feasible_reports,
+            key=lambda r: (
+                -r.get("epsilon", 0.0),
+                r.get("dist", float("inf")),
+                r.get("moment", float("inf")),
+            ),
+        )
+    else:
+        reports_sorted = sorted(
+            feasible_reports,
+            key=lambda r: (r.get("dist", float("inf")), r.get("moment", float("inf"))),
+        )
     return reports_sorted
 
 
@@ -1581,7 +1632,13 @@ def check_gripper_feasibility_faces_with_rotation(
     max_face_trials_per_pair: int = 40,
     max_feasible_per_pair: int = 4,
     use_broadphase: bool = True,
+    sort_key: str = "dist_moment",
+    epsilon_mu: float = PadParams.mu,
+    epsilon_k: int = 16,
 ):
+    if sort_key not in ("dist_moment", "epsilon"):
+        raise ValueError("sort_key must be one of: 'dist_moment', 'epsilon'")
+
     mesh = result[use_mesh]
     mesh_ch = result[check_mesh]
     patches = {p["id"]: p for p in result["patches"]}
@@ -1667,15 +1724,38 @@ def check_gripper_feasibility_faces_with_rotation(
                     feasible=True,
                 )
             )
+            if sort_key == "epsilon":
+                reports[-1]["epsilon"] = float(
+                    calculate_epsilon_quality(
+                        ci,
+                        n_i,
+                        best_cj,
+                        n_j,
+                        np.asarray(com, float),
+                        mu=epsilon_mu,
+                        k=epsilon_k,
+                    )
+                )
 
             feasible_for_pair += 1
             if feasible_for_pair >= max_feasible_per_pair:
                 break
 
-    reports_sorted = sorted(
-        [r for r in reports if r.get("feasible")],
-        key=lambda r: (r.get("dist", float("inf")), r.get("moment", float("inf"))),
-    )
+    feasible_reports = [r for r in reports if r.get("feasible")]
+    if sort_key == "epsilon":
+        reports_sorted = sorted(
+            feasible_reports,
+            key=lambda r: (
+                -r.get("epsilon", 0.0),
+                r.get("dist", float("inf")),
+                r.get("moment", float("inf")),
+            ),
+        )
+    else:
+        reports_sorted = sorted(
+            feasible_reports,
+            key=lambda r: (r.get("dist", float("inf")), r.get("moment", float("inf"))),
+        )
     return reports_sorted
 
 
