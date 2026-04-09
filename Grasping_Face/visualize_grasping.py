@@ -1139,6 +1139,8 @@ def visualize_wrench_space(
     
     # 1. 렌치 계산
     # gf.unit 사용
+    # NOTE: Legacy point-contact visualization. For surface-contact model,
+    # use `visualize_squeeze_wrench_space`.
     inward_n_i = -gf.unit(np.asarray(n_i))
     inward_n_j = -gf.unit(np.asarray(n_j))
     
