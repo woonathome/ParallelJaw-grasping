@@ -710,6 +710,124 @@ def play_in_viewer_from_html(
     )
 
 
+def record_offscreen_from_parsed_grasp(
+    grasp: TopGraspData,
+    video_path: str,
+    cfg: Optional[SimConfig] = None,
+    *,
+    video_fps: int = 30,
+    video_width: int = 960,
+    video_height: int = 540,
+    camera_azimuth: float = 135.0,
+    camera_elevation: float = -25.0,
+    camera_distance_scale: float = 3.0,
+    show_contact_points: bool = False,
+    show_contact_forces: bool = False,
+) -> Dict[str, Any]:
+    """
+    Record MuJoCo simulation directly from an offscreen renderer (no viewer window).
+    """
+    _require_mujoco()
+    import cv2
+
+    cfg = cfg or SimConfig()
+    model, data, inner, ids = _init_simulation(grasp, cfg)
+
+    out_path = Path(video_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    renderer = mujoco.Renderer(model, height=int(video_height), width=int(video_width))
+    cam = mujoco.MjvCamera()
+    mujoco.mjv_defaultCamera(cam)
+    cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    cam.azimuth = float(camera_azimuth)
+    cam.elevation = float(camera_elevation)
+    cam.distance = max(0.35, float(camera_distance_scale) * float(model.stat.extent))
+    cam.lookat[:] = data.xpos[ids["bid_obj"]]
+
+    opt = mujoco.MjvOption()
+    mujoco.mjv_defaultOption(opt)
+    opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = 1 if show_contact_points else 0
+    opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = 1 if show_contact_forces else 0
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(out_path), fourcc, float(video_fps), (int(video_width), int(video_height)))
+    if not writer.isOpened():
+        renderer.close()
+        raise RuntimeError(f"Could not open VideoWriter for: {out_path}")
+
+    frame_step = max(1, int(round(1.0 / (max(1, int(video_fps)) * float(cfg.timestep)))))
+    step_idx = 0
+
+    def _capture_frame(_: Any, __: Any) -> None:
+        nonlocal step_idx
+        step_idx += 1
+        if step_idx % frame_step != 0:
+            return
+        renderer.update_scene(data, camera=cam, scene_option=opt)
+        rgb = renderer.render()
+        writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+    try:
+        # initial frame
+        renderer.update_scene(data, camera=cam, scene_option=opt)
+        rgb0 = renderer.render()
+        writer.write(cv2.cvtColor(rgb0, cv2.COLOR_RGB2BGR))
+
+        result = _run_simulation_core(
+            model=model,
+            data=data,
+            grasp=grasp,
+            cfg=cfg,
+            inner=inner,
+            ids=ids,
+            on_step=_capture_frame,
+        )
+
+        # final settle frames
+        renderer.update_scene(data, camera=cam, scene_option=opt)
+        rgbf = renderer.render()
+        for _ in range(max(1, int(video_fps * 0.2))):
+            writer.write(cv2.cvtColor(rgbf, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+        renderer.close()
+
+    result["video_path"] = str(out_path)
+    return result
+
+
+def record_offscreen_from_html(
+    html_path: str,
+    video_path: str,
+    cfg: Optional[SimConfig] = None,
+    *,
+    video_fps: int = 30,
+    video_width: int = 960,
+    video_height: int = 540,
+    camera_azimuth: float = 135.0,
+    camera_elevation: float = -25.0,
+    camera_distance_scale: float = 3.0,
+    show_contact_points: bool = False,
+    show_contact_forces: bool = False,
+) -> Dict[str, Any]:
+    cfg = cfg or SimConfig()
+    parsed = parse_top_grasp_from_html(html_path, unit_scale=cfg.unit_scale)
+    return record_offscreen_from_parsed_grasp(
+        parsed,
+        video_path=video_path,
+        cfg=cfg,
+        video_fps=video_fps,
+        video_width=video_width,
+        video_height=video_height,
+        camera_azimuth=camera_azimuth,
+        camera_elevation=camera_elevation,
+        camera_distance_scale=camera_distance_scale,
+        show_contact_points=show_contact_points,
+        show_contact_forces=show_contact_forces,
+    )
+
+
 def run_from_html(
     html_path: str,
     *,
@@ -730,6 +848,13 @@ def run_from_html(
     realtime_viewer: bool = True,
     show_contact_points: bool = False,
     show_contact_forces: bool = False,
+    record_video_path: Optional[str] = None,
+    record_video_fps: int = 30,
+    record_video_width: int = 960,
+    record_video_height: int = 540,
+    record_camera_azimuth: float = 135.0,
+    record_camera_elevation: float = -25.0,
+    record_camera_distance_scale: float = 3.0,
 ) -> Dict[str, Any]:
     cfg = SimConfig(
         depth_speed=depth_speed,
@@ -746,6 +871,20 @@ def run_from_html(
         perturb_time=perturb_time,
         hold_time=hold_time,
     )
+    if record_video_path:
+        return record_offscreen_from_html(
+            html_path=html_path,
+            video_path=record_video_path,
+            cfg=cfg,
+            video_fps=record_video_fps,
+            video_width=record_video_width,
+            video_height=record_video_height,
+            camera_azimuth=record_camera_azimuth,
+            camera_elevation=record_camera_elevation,
+            camera_distance_scale=record_camera_distance_scale,
+            show_contact_points=show_contact_points,
+            show_contact_forces=show_contact_forces,
+        )
     if open_viewer:
         return play_in_viewer_from_html(
             html_path,

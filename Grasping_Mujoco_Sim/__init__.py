@@ -4,6 +4,8 @@ from .mujoco_parallel_jaw_sim import (
     launch_notebook_ui,
     play_in_viewer_from_html,
     play_in_viewer_from_parsed_grasp,
+    record_offscreen_from_html,
+    record_offscreen_from_parsed_grasp,
     run_from_html,
     simulate_from_html,
     simulate_from_parsed_grasp,
@@ -17,6 +19,8 @@ __all__ = [
     "simulate_from_html",
     "play_in_viewer_from_parsed_grasp",
     "play_in_viewer_from_html",
+    "record_offscreen_from_parsed_grasp",
+    "record_offscreen_from_html",
     "run_from_html",
     "launch_notebook_ui",
 ]
