@@ -24,7 +24,7 @@ class SimConfig:
     # Contact/grasp parameters
     friction: float = 0.8
     grasp_force: float = 90.0
-    object_density: float = 850.0
+    object_density: float = 7870.0
     gravity_z: float = 0.0
 
     # Parallel-jaw pad dimensions (meter)
@@ -33,12 +33,12 @@ class SimConfig:
     pad_depth: float = 0.007
 
     # Initial opening and closing behavior (meter)
-    pre_clearance: float = 0.004
+    pre_clearance: float = 0.002
     squeeze_extra: float = 0.0015
     close_ramp: bool = True
     require_dual_contact: bool = True
-    tighten_step: float = 0.001
-    max_tighten_iters: int = 80
+    tighten_step: float = 0.0002
+    max_tighten_iters: int = 500
     tighten_settle_time: float = 0.03
     recenter_step: float = 0.0008
     max_recenter_iters: int = 12
@@ -51,7 +51,7 @@ class SimConfig:
     max_move: float = 0.03
 
     # Timing
-    timestep: float = 0.001
+    timestep: float = 0.0002
     close_time: float = 0.35
     settle_time: float = 0.2
     perturb_time: float = 0.08
@@ -440,22 +440,7 @@ def _run_simulation_core(
         if aborted:
             break
 
-        _restore_state(model, data, grasped_state)
-        data.ctrl[ids["aid_tx"]] = tx_bias
-        data.ctrl[ids["aid_ty"]] = 0.0
-        data.ctrl[ids["aid_tz"]] = 0.0
-        _set_finger_target(final_close_target)
-
         move_target = float(np.clip(speed * cfg.perturb_time, -cfg.max_move, cfg.max_move))
-        lost_contact_steps = 0
-        lost_contact_steps_max = 0
-        max_rel_shift = 0.0
-        had_contact = False
-        phase_stats: Dict[str, Dict[str, Any]] = {
-            "positive": {"max_relative_shift_m": 0.0, "lost_contact_steps_max": 0, "had_contact": False},
-            "negative": {"max_relative_shift_m": 0.0, "lost_contact_steps_max": 0, "had_contact": False},
-            "return": {"max_relative_shift_m": 0.0, "lost_contact_steps_max": 0, "had_contact": False},
-        }
 
         def _set_axis_offset(offset: float) -> None:
             data.ctrl[ids["aid_tx"]] = tx_bias
@@ -468,77 +453,124 @@ def _run_simulation_core(
             else:
                 data.ctrl[ids["aid_tz"]] = offset
 
-        def _update_contact_and_shift(phase_key: str) -> None:
-            nonlocal lost_contact_steps, lost_contact_steps_max, max_rel_shift, had_contact
-            in_contact = _has_object_finger_contact(data, ids["gid_obj"], finger_gids)
-            had_contact = had_contact or in_contact
-            phase_stats[phase_key]["had_contact"] = bool(phase_stats[phase_key]["had_contact"] or in_contact)
+        def _make_empty_excursion() -> Dict[str, Any]:
+            return {
+                "max_relative_shift_m": 0.0,
+                "lost_contact_steps_max": 0,
+                "had_contact": False,
+                "escaped": False,
+                "escaped_outward": False,
+                "escaped_return": False,
+                "returned_to_origin": False,
+                "phase": {
+                    "outward": {"max_relative_shift_m": 0.0, "lost_contact_steps_max": 0, "had_contact": False},
+                    "return": {"max_relative_shift_m": 0.0, "lost_contact_steps_max": 0, "had_contact": False},
+                },
+            }
 
-            lost_contact_steps = 0 if in_contact else (lost_contact_steps + 1)
-            lost_contact_steps_max = max(lost_contact_steps_max, lost_contact_steps)
-            phase_stats[phase_key]["lost_contact_steps_max"] = max(
-                int(phase_stats[phase_key]["lost_contact_steps_max"]), lost_contact_steps
+        def _run_excursion(signed_target: float) -> Dict[str, Any]:
+            nonlocal aborted
+            rec = _make_empty_excursion()
+            if aborted:
+                return rec
+
+            _restore_state(model, data, grasped_state)
+            data.ctrl[ids["aid_tx"]] = tx_bias
+            data.ctrl[ids["aid_ty"]] = 0.0
+            data.ctrl[ids["aid_tz"]] = 0.0
+            _set_finger_target(final_close_target)
+
+            lost_contact_steps = 0
+
+            def _update_contact_and_shift(phase_key: str) -> None:
+                nonlocal lost_contact_steps
+                in_contact = _has_object_finger_contact(data, ids["gid_obj"], finger_gids)
+                rec["had_contact"] = bool(rec["had_contact"] or in_contact)
+                rec["phase"][phase_key]["had_contact"] = bool(rec["phase"][phase_key]["had_contact"] or in_contact)
+
+                lost_contact_steps = 0 if in_contact else (lost_contact_steps + 1)
+                rec["lost_contact_steps_max"] = max(int(rec["lost_contact_steps_max"]), lost_contact_steps)
+                rec["phase"][phase_key]["lost_contact_steps_max"] = max(
+                    int(rec["phase"][phase_key]["lost_contact_steps_max"]), lost_contact_steps
+                )
+
+                rel_now = data.xpos[ids["bid_obj"]] - data.xpos[ids["bid_gripper"]]
+                rel_shift = float(np.linalg.norm(rel_now - rel_ref))
+                rec["max_relative_shift_m"] = max(float(rec["max_relative_shift_m"]), rel_shift)
+                rec["phase"][phase_key]["max_relative_shift_m"] = max(
+                    float(rec["phase"][phase_key]["max_relative_shift_m"]), rel_shift
+                )
+
+            def _run_leg(
+                phase_key: str,
+                start_offset: float,
+                end_offset: float,
+                ramp_steps: int,
+                hold_steps: int,
+            ) -> bool:
+                ramp_steps = max(1, int(ramp_steps))
+                for si in range(ramp_steps):
+                    if aborted:
+                        return False
+                    alpha = float(si + 1) / float(ramp_steps)
+                    offset = start_offset + (end_offset - start_offset) * alpha
+                    _set_axis_offset(offset)
+                    if not _step_once():
+                        return False
+                    _update_contact_and_shift(phase_key)
+
+                for _ in range(max(0, int(hold_steps))):
+                    if aborted:
+                        return False
+                    _set_axis_offset(end_offset)
+                    if not _step_once():
+                        return False
+                    _update_contact_and_shift(phase_key)
+                return True
+
+            ok = _run_leg("outward", 0.0, signed_target, steps_perturb, steps_hold)
+            if ok:
+                ok = _run_leg("return", signed_target, 0.0, steps_perturb, steps_hold)
+            rec["returned_to_origin"] = bool(ok and (not aborted))
+
+            rec["escaped_outward"] = bool(
+                (int(rec["phase"]["outward"]["lost_contact_steps_max"]) >= cfg.min_loss_contact_steps)
+                or (float(rec["phase"]["outward"]["max_relative_shift_m"]) > cfg.escape_distance)
             )
-
-            rel_now = data.xpos[ids["bid_obj"]] - data.xpos[ids["bid_gripper"]]
-            rel_shift = float(np.linalg.norm(rel_now - rel_ref))
-            max_rel_shift = max(max_rel_shift, rel_shift)
-            phase_stats[phase_key]["max_relative_shift_m"] = max(
-                float(phase_stats[phase_key]["max_relative_shift_m"]), rel_shift
+            rec["escaped_return"] = bool(
+                (int(rec["phase"]["return"]["lost_contact_steps_max"]) >= cfg.min_loss_contact_steps)
+                or (float(rec["phase"]["return"]["max_relative_shift_m"]) > cfg.escape_distance)
             )
+            rec["escaped"] = bool(rec["escaped_outward"] or rec["escaped_return"])
+            return rec
 
-        def _run_phase(
-            phase_key: str,
-            start_offset: float,
-            end_offset: float,
-            ramp_steps: int,
-            hold_steps: int,
-        ) -> bool:
-            ramp_steps = max(1, int(ramp_steps))
-            for si in range(ramp_steps):
-                if aborted:
-                    return False
-                alpha = float(si + 1) / float(ramp_steps)
-                offset = start_offset + (end_offset - start_offset) * alpha
-                _set_axis_offset(offset)
-                if not _step_once():
-                    return False
-                _update_contact_and_shift(phase_key)
+        positive_rec = _run_excursion(+move_target)
+        negative_rec = _run_excursion(-move_target)
 
-            for _ in range(max(0, int(hold_steps))):
-                if aborted:
-                    return False
-                _set_axis_offset(end_offset)
-                if not _step_once():
-                    return False
-                _update_contact_and_shift(phase_key)
-            return True
-
-        # + direction -> - direction -> return to 0
-        did_return = False
-        if _run_phase("positive", 0.0, move_target, steps_perturb, steps_hold):
-            if _run_phase("negative", move_target, -move_target, steps_perturb * 2, steps_hold):
-                did_return = _run_phase("return", -move_target, 0.0, steps_perturb, steps_hold)
-
-        escaped_positive = bool(
-            (int(phase_stats["positive"]["lost_contact_steps_max"]) >= cfg.min_loss_contact_steps)
-            or (float(phase_stats["positive"]["max_relative_shift_m"]) > cfg.escape_distance)
+        max_rel_shift = max(
+            float(positive_rec["max_relative_shift_m"]),
+            float(negative_rec["max_relative_shift_m"]),
         )
-        escaped_negative = bool(
-            (int(phase_stats["negative"]["lost_contact_steps_max"]) >= cfg.min_loss_contact_steps)
-            or (float(phase_stats["negative"]["max_relative_shift_m"]) > cfg.escape_distance)
+        lost_contact_steps_max = max(
+            int(positive_rec["lost_contact_steps_max"]),
+            int(negative_rec["lost_contact_steps_max"]),
         )
-        escaped_return = bool(
-            (int(phase_stats["return"]["lost_contact_steps_max"]) >= cfg.min_loss_contact_steps)
-            or (float(phase_stats["return"]["max_relative_shift_m"]) > cfg.escape_distance)
-        )
-        escaped = bool(escaped_positive or escaped_negative or escaped_return)
+        had_contact = bool(positive_rec["had_contact"] or negative_rec["had_contact"])
+        escaped_positive = bool(positive_rec["escaped"])
+        escaped_negative = bool(negative_rec["escaped"])
+        escaped_return = bool(positive_rec["escaped_return"] or negative_rec["escaped_return"])
+        escaped = bool(escaped_positive or escaped_negative)
+        phase_stats: Dict[str, Dict[str, Any]] = {
+            "positive": positive_rec["phase"],
+            "negative": negative_rec["phase"],
+        }
+        did_return = bool(positive_rec["returned_to_origin"] and negative_rec["returned_to_origin"])
 
         perturb_results[axis_name] = {
             "speed_mps": speed,
             "move_target_m": move_target,
             "max_relative_shift_m": max_rel_shift,
-            "lost_contact_steps": int(lost_contact_steps),
+            "lost_contact_steps": int(lost_contact_steps_max),
             "lost_contact_steps_max": int(lost_contact_steps_max),
             "had_contact": bool(had_contact),
             "escaped": escaped,
