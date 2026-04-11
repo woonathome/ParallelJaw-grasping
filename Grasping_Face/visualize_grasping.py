@@ -1172,7 +1172,7 @@ def visualize_wrench_space(
         except Exception as e:
             print(f"Could not compute 3D Force Hull: {e}. Plotting points.")
             traces.append(go.Scatter3d(x=forces[:,0], y=forces[:,1], z=forces[:,2], 
-                          mode='markers', marker=dict(color="#0092BB", size=2), 
+                          mode='markers', marker=dict(color=color_def, size=2), 
                           name="Force Vectors (primitive)"))
 
     # 3. Torque Space (RWS) 시각화
@@ -1186,7 +1186,7 @@ def visualize_wrench_space(
         except Exception as e:
             print(f"Could not compute 3D Torque Hull: {e}. Plotting points.")
             traces.append(go.Scatter3d(x=torques[:,0], y=torques[:,1], z=torques[:,2], 
-                          mode='markers', marker=dict(color="#0092BB", size=2), 
+                          mode='markers', marker=dict(color=color_def, size=2), 
                           name="Torque Vectors (primitive)"))
     
     # 4. Plotly Figure 생성
@@ -1220,6 +1220,8 @@ def visualize_squeeze_wrench_space(
     squeeze_depth: float = 0.1,
     mu: float = gf.PadParams.mu,
     k: int = 8,
+    max_contact_points_per_pad: int = 8,
+    color_def: str = "#0092BB",
     show: bool = True
 ) -> Optional[go.Figure]:
     """
@@ -1228,15 +1230,22 @@ def visualize_squeeze_wrench_space(
     """
     
     # 1. 접촉점 및 패드 박스 추출 (Squeeze 로직 사용)
-    # 최적화를 위해 부분 메쉬 사용
-    # gf.get_points_in_squeezed_pad 사용
-    mesh_i = mesh.submesh([f_i_idx], append=True)
-    pts_i, box_i = gf.get_points_in_squeezed_pad(mesh_i, {"centroid": c_i, "normal": n_i}, 
-                                                 pad_w, pad_h, pad_d, yaw_i, squeeze_depth)
-    
-    mesh_j = mesh.submesh([f_j_idx], append=True)
-    pts_j, box_j = gf.get_points_in_squeezed_pad(mesh_j, {"centroid": c_j, "normal": n_j}, 
-                                                 pad_w, pad_h, pad_d, yaw_j, squeeze_depth)
+    # patch face 인덱스에서 직접 샘플점 생성 (submesh 구성 비용 제거)
+    samples_i = gf._build_patch_sample_points_from_faces(mesh, np.asarray(f_i_idx, dtype=np.int64))
+    pts_i, box_i = gf.get_points_in_squeezed_pad(
+        mesh, {"centroid": c_i, "normal": n_i},
+        pad_w, pad_h, pad_d, yaw_i, squeeze_depth,
+        sample_points=samples_i,
+        max_outer_points=int(max_contact_points_per_pad),
+    )
+
+    samples_j = gf._build_patch_sample_points_from_faces(mesh, np.asarray(f_j_idx, dtype=np.int64))
+    pts_j, box_j = gf.get_points_in_squeezed_pad(
+        mesh, {"centroid": c_j, "normal": n_j},
+        pad_w, pad_h, pad_d, yaw_j, squeeze_depth,
+        sample_points=samples_j,
+        max_outer_points=int(max_contact_points_per_pad),
+    )
 
     all_points = []
     if len(pts_i) > 0: all_points.append(pts_i)
@@ -1290,7 +1299,7 @@ def visualize_squeeze_wrench_space(
                             color='#cfcfcf', opacity=0.6, name='Object Mesh'), row=1, col=1)
     
     # B. Squeezed Pads (Visualizing the intrusion)
-    for box, name, color in [(box_i, 'Pad I', "#0092BB"), (box_j, 'Pad J', "#0092BB")]:
+    for box, name, color in [(box_i, 'Pad I', color_def), (box_j, 'Pad J', color_def)]:
         bx, by, bz = box.vertices.T
         bI, bJ, bK = box.faces.T
         fig.add_trace(go.Mesh3d(x=bx, y=by, z=bz, i=bI, j=bJ, k=bK, 
@@ -1299,7 +1308,7 @@ def visualize_squeeze_wrench_space(
     # C. Contact Points (실제 힘이 가해지는 점들)
     fig.add_trace(go.Scatter3d(
         x=contact_points[:,0], y=contact_points[:,1], z=contact_points[:,2],
-        mode='markers', marker=dict(size=2, color="#0092BB"), name='Contact Points'
+        mode='markers', marker=dict(size=2, color=color_def), name='Contact Points'
     ), row=1, col=1)
 
     # D. CoM
@@ -1314,14 +1323,14 @@ def visualize_squeeze_wrench_space(
         # Hull Vertices
         fig.add_trace(go.Scatter3d(
             x=forces[:,0], y=forces[:,1], z=forces[:,2],
-            mode='markers', marker=dict(size=2, color="#0092BB", opacity=0.5), name='Force Vectors EndPoints'
+            mode='markers', marker=dict(size=2, color=color_def, opacity=0.5), name='Force Vectors EndPoints'
         ), row=1, col=2)
         # Hull Surface
         hf = hull_f.simplices
         fig.add_trace(go.Mesh3d(
             x=forces[:,0], y=forces[:,1], z=forces[:,2],
             i=hf[:,0], j=hf[:,1], k=hf[:,2],
-            color="#0092BB", opacity=0.3, name='Force Hull'
+            color=color_def, opacity=0.3, name='Force Hull'
         ), row=1, col=2)
         # Origin
         fig.add_trace(go.Scatter3d(x=[0], y=[0], z=[0], mode='markers', marker=dict(size=5, color='black'), name='Origin'), row=1, col=2)
@@ -1335,14 +1344,14 @@ def visualize_squeeze_wrench_space(
         # Hull Vertices
         fig.add_trace(go.Scatter3d(
             x=torques[:,0], y=torques[:,1], z=torques[:,2],
-            mode='markers', marker=dict(size=2, color="#0092BB", opacity=0.5), name='Torque Vectors EndPoints'
+            mode='markers', marker=dict(size=2, color=color_def, opacity=0.5), name='Torque Vectors EndPoints'
         ), row=1, col=3)
         # Hull Surface
         ht = hull_t.simplices
         fig.add_trace(go.Mesh3d(
             x=torques[:,0], y=torques[:,1], z=torques[:,2],
             i=ht[:,0], j=ht[:,1], k=ht[:,2],
-            color="#0092BB", opacity=0.3, name='Torque Hull'
+            color=color_def, opacity=0.3, name='Torque Hull'
         ), row=1, col=3)
         # Origin
         fig.add_trace(go.Scatter3d(x=[0], y=[0], z=[0], mode='markers', marker=dict(size=5, color='black'), name='Origin'), row=1, col=3)

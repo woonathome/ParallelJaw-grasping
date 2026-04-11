@@ -1,6 +1,7 @@
 # Compute Patch Pairs, Feasible Grasping Pairs
 
 import json, math
+from time import perf_counter
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
@@ -1014,6 +1015,30 @@ def _best_face_matches(
     return out
 
 
+def _faces_by_center_priority(
+    face_centroids: np.ndarray,
+    face_idx: np.ndarray,
+    patch_centroid: np.ndarray,
+    max_keep: int = 0,
+) -> np.ndarray:
+    """
+    Sort patch faces by distance to patch centroid (nearer first),
+    and optionally keep only first `max_keep`.
+    """
+    idx = np.asarray(face_idx, dtype=np.int64).reshape(-1)
+    if len(idx) == 0:
+        return idx
+
+    c = np.asarray(patch_centroid, dtype=float).reshape(1, 3)
+    d = np.linalg.norm(face_centroids[idx] - c, axis=1)
+    order = np.argsort(d)
+    idx_sorted = idx[order]
+
+    if int(max_keep) > 0 and len(idx_sorted) > int(max_keep):
+        idx_sorted = idx_sorted[: int(max_keep)]
+    return idx_sorted
+
+
 def _collision_broadphase_reject(
     geom: trimesh.Trimesh,
     mesh_bounds: np.ndarray,
@@ -1043,6 +1068,9 @@ def check_gripper_feasibility_faces_with_yaw(
     sort_key: str = "epsilon", # "dist_moment", "epsilon"
     epsilon_mu: float = PadParams.mu,
     epsilon_k: int = 16,
+    epsilon_max_contact_points_per_pad: int = 8,
+    precompute_patch_samples: bool = True,
+    return_profile: bool = False,
 ):
     if sort_key not in ("dist_moment", "epsilon"):
         raise ValueError("sort_key must be one of: 'epsilon', 'dist_moment'")
@@ -1053,6 +1081,30 @@ def check_gripper_feasibility_faces_with_yaw(
     pairs = result.get("top_k", [])
     face_centroids = _precompute_face_centroids(mesh)
     patch_faces = {pid: np.asarray(p["face_indices"], dtype=np.int64) for pid, p in patches.items()}
+    mesh_ch_len = 0.5 * float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])) if len(mesh.faces) > 0 else 1.0
+
+    # Profiling counters for bottleneck inspection
+    t_total = perf_counter()
+    t_collision = 0.0
+    n_collision = 0
+    t_epsilon = 0.0
+    n_epsilon = 0
+    t_prepare_samples = 0.0
+
+    # Always use patch-index base mesh for patch sampling (avoid dense/original mesh mismatch)
+    mesh_sampling = result.get("mesh_patches", mesh)
+
+    # Precompute per-patch sample points once (major speed-up for surface-contact epsilon)
+    patch_sample_cache: Dict[int, np.ndarray] = {}
+    if sort_key == "epsilon" and precompute_patch_samples:
+        cached = result.get("_patch_sample_cache")
+        if isinstance(cached, dict) and len(cached) > 0:
+            patch_sample_cache = cached
+        else:
+            tp = perf_counter()
+            patch_sample_cache = _prepare_patch_sample_cache(mesh_sampling, patch_faces)
+            t_prepare_samples = perf_counter() - tp
+            result["_patch_sample_cache"] = patch_sample_cache
 
     try:
         com = mesh_ch.center_mass
@@ -1080,11 +1132,25 @@ def check_gripper_feasibility_faces_with_yaw(
         n_i = unit(np.asarray(p_i["normal"], float))
         n_j = unit(np.asarray(p_j["normal"], float))
 
+        # Prioritize faces near patch center (instead of raw index order)
+        face_i_ordered = _faces_by_center_priority(
+            face_centroids,
+            patch_faces[pid_i],
+            np.asarray(p_i["centroid"], float),
+            max_keep=max_face_trials_per_pair,
+        )
+        face_j_ordered = _faces_by_center_priority(
+            face_centroids,
+            patch_faces[pid_j],
+            np.asarray(p_j["centroid"], float),
+            max_keep=max_face_trials_per_pair,
+        )
+
         reports_for_this_pair = []
         matches = _best_face_matches(
             face_centroids,
-            patch_faces[pid_i],
-            patch_faces[pid_j],
+            face_i_ordered,
+            face_j_ordered,
             n_i,
             n_j,
             max_face_trials_per_pair=max_face_trials_per_pair,
@@ -1117,14 +1183,20 @@ def check_gripper_feasibility_faces_with_yaw(
                 if use_broadphase and _collision_broadphase_reject(box_i, mesh_bounds, mesh_center, mesh_radius):
                     coll_i = False
                 else:
+                    tc = perf_counter()
                     coll_i = cm.in_collision_single(box_i)
+                    t_collision += perf_counter() - tc
+                    n_collision += 1
                 if coll_i:
                     continue
 
                 if use_broadphase and _collision_broadphase_reject(box_j, mesh_bounds, mesh_center, mesh_radius):
                     coll_j = False
                 else:
+                    tc = perf_counter()
                     coll_j = cm.in_collision_single(box_j)
+                    t_collision += perf_counter() - tc
+                    n_collision += 1
                 if coll_j:
                     continue
 
@@ -1149,10 +1221,13 @@ def check_gripper_feasibility_faces_with_yaw(
                     )
                 )
                 if sort_key == "epsilon":
+                    patch_i_samples = patch_sample_cache.get(pid_i) if patch_sample_cache else None
+                    patch_j_samples = patch_sample_cache.get(pid_j) if patch_sample_cache else None
+                    te = perf_counter()
                     reports_for_this_pair[-1]["epsilon"] = float(
                         # calculate_epsilon_quality(ci, n_i, best_cj, n_j, np.asarray(com, float), mu=epsilon_mu, k=epsilon_k,)
                         calculate_squeeze_epsilon_quality(
-                            mesh=mesh_ch,
+                            mesh=mesh,
                             f_i_idx=patch_faces[pid_i],
                             f_j_idx=patch_faces[pid_j],
                             c_i=ci,
@@ -1164,8 +1239,15 @@ def check_gripper_feasibility_faces_with_yaw(
                             com=np.asarray(com, float),
                             mu=epsilon_mu,
                             k=epsilon_k,
+                            patch_i_samples=patch_i_samples,
+                            patch_j_samples=patch_j_samples,
+                            ch_len=mesh_ch_len,
+                            sampling_mesh=mesh_sampling,
+                            max_contact_points_per_pad=int(epsilon_max_contact_points_per_pad),
                         )
                     )
+                    t_epsilon += perf_counter() - te
+                    n_epsilon += 1
 
                 if len(reports_for_this_pair) >= max_feasible_per_pair:
                     break
@@ -1182,7 +1264,7 @@ def check_gripper_feasibility_faces_with_yaw(
         reports_sorted = sorted(
             feasible_reports,
             key=lambda r: (
-                r.get("epsilon", 0.0),
+                -r.get("epsilon", -1.0),
                 r.get("dist", float("inf")),
                 r.get("moment", float("inf")),
             ),
@@ -1192,6 +1274,21 @@ def check_gripper_feasibility_faces_with_yaw(
             feasible_reports,
             key=lambda r: (r.get("dist", float("inf")), r.get("moment", float("inf"))),
         )
+    if return_profile:
+        t_total_elapsed = perf_counter() - t_total
+        profile = {
+            "total_sec": float(t_total_elapsed),
+            "num_pairs": int(len(pairs)),
+            "num_reports_feasible": int(len(feasible_reports)),
+            "collision_sec": float(t_collision),
+            "collision_calls": int(n_collision),
+            "epsilon_sec": float(t_epsilon),
+            "epsilon_calls": int(n_epsilon),
+            "prepare_patch_samples_sec": float(t_prepare_samples),
+            "epsilon_share_percent": float((t_epsilon / t_total_elapsed) * 100.0) if t_total_elapsed > 0 else 0.0,
+            "collision_share_percent": float((t_collision / t_total_elapsed) * 100.0) if t_total_elapsed > 0 else 0.0,
+        }
+        return reports_sorted, profile
     return reports_sorted
 
 
@@ -1246,11 +1343,25 @@ def check_gripper_feasibility_faces_with_rotation(
         n_i = unit(np.asarray(p_i["normal"], float))
         n_j = unit(np.asarray(p_j["normal"], float))
 
+        # Prioritize faces near patch center (instead of raw index order)
+        face_i_ordered = _faces_by_center_priority(
+            face_centroids,
+            patch_faces[pid_i],
+            np.asarray(p_i["centroid"], float),
+            max_keep=max_face_trials_per_pair,
+        )
+        face_j_ordered = _faces_by_center_priority(
+            face_centroids,
+            patch_faces[pid_j],
+            np.asarray(p_j["centroid"], float),
+            max_keep=max_face_trials_per_pair,
+        )
+
         feasible_for_pair = 0
         matches = _best_face_matches(
             face_centroids,
-            patch_faces[pid_i],
-            patch_faces[pid_j],
+            face_i_ordered,
+            face_j_ordered,
             n_i,
             n_j,
             max_face_trials_per_pair=max_face_trials_per_pair,
@@ -1313,7 +1424,7 @@ def check_gripper_feasibility_faces_with_rotation(
         reports_sorted = sorted(
             feasible_reports,
             key=lambda r: (
-                r.get("epsilon", 0.0),
+                -r.get("epsilon", -1.0),
                 r.get("dist", float("inf")),
                 r.get("moment", float("inf")),
             ),
@@ -1449,25 +1560,38 @@ def calculate_epsilon_quality(
 
 # Friction Cone Wrench 계산
 def add_wrenches(points, normal, com, ch_len, mu=PadParams.mu, k=8):
-    # Tangent, Bitangent
-    t, b, _ = basis_from_normal(normal)
-    angle_step = 2 * np.pi / k
-    wrenches = []
-    for pt in points:
-        r = pt - com # 모멘트 암
-        for i in range(k):
-            theta = i * angle_step
-            # Force direction (Normal + Friction)
-            f = normal + mu * np.cos(theta) * t + mu * np.sin(theta) * b
-            f = f / np.linalg.norm(f) # 스케일링
-            # Torque
-            tau = np.cross(r, f)
-            # Wrench
-            # w = np.concatenate([f, tau / ch_len]) # 토크를 Characteristic Length로 힘/토크 스케일 보정
-            w = np.concatenate([f, tau])
-            wrenches.append(w)
-    
-    return np.array(wrenches)
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim == 1:
+        pts = pts.reshape(-1, 3)
+    if len(pts) == 0 or int(k) <= 0:
+        return np.zeros((0, 6), dtype=float)
+
+    n = unit(np.asarray(normal, dtype=float))
+    com = np.asarray(com, dtype=float).reshape(1, 3)
+    kk = int(k)
+
+    # Tangent, bitangent basis of contact normal
+    t, b, _ = basis_from_normal(n)
+    theta = (2.0 * np.pi / float(kk)) * np.arange(kk, dtype=float)
+    cos_t = np.cos(theta)[:, None]
+    sin_t = np.sin(theta)[:, None]
+
+    # Friction-cone boundary forces for one contact point: (k, 3)
+    forces_k = (
+        n.reshape(1, 3)
+        + float(mu) * cos_t * t.reshape(1, 3)
+        + float(mu) * sin_t * b.reshape(1, 3)
+    )
+    forces_k = forces_k / (np.linalg.norm(forces_k, axis=1, keepdims=True) + 1e-12)
+
+    # Broadcast to all contact points: (N, k, 3)
+    forces = np.broadcast_to(forces_k[None, :, :], (len(pts), kk, 3))
+    r = (pts - com).reshape(len(pts), 1, 3)
+    tau = np.cross(r, forces)
+
+    # NOTE: ch_len is kept for API compatibility (not used here).
+    wrenches = np.concatenate([forces, tau], axis=2).reshape(-1, 6)
+    return wrenches
 
 # Pad 위치에 따른 Contact Points 찾기
 def _build_patch_sample_points(patch_mesh: trimesh.Trimesh) -> np.ndarray:
@@ -1498,24 +1622,161 @@ def _build_patch_sample_points(patch_mesh: trimesh.Trimesh) -> np.ndarray:
     )
 
 
+def _sanitize_face_index_array(face_indices: np.ndarray, n_faces: int) -> np.ndarray:
+    idx = np.unique(np.asarray(face_indices, dtype=np.int64).reshape(-1))
+    if int(n_faces) <= 0:
+        return np.zeros((0,), dtype=np.int64)
+    return idx[(idx >= 0) & (idx < int(n_faces))]
+
+
+def _build_patch_sample_points_from_faces(mesh: trimesh.Trimesh, face_indices: np.ndarray) -> np.ndarray:
+    """
+    Build patch sample points directly from mesh face indices (global index on mesh),
+    without constructing an intermediate Trimesh.submesh object.
+    """
+    if mesh is None or len(mesh.faces) == 0 or len(mesh.vertices) == 0:
+        return np.zeros((0, 3), dtype=float)
+
+    idx = _sanitize_face_index_array(face_indices, len(mesh.faces))
+    if len(idx) == 0:
+        return np.zeros((0, 3), dtype=float)
+
+    faces = np.asarray(mesh.faces[idx], dtype=np.int64)
+    tri = np.asarray(mesh.vertices[faces], dtype=float)
+    if len(tri) == 0:
+        return np.zeros((0, 3), dtype=float)
+
+    unique_vid = np.unique(faces.reshape(-1))
+    verts = np.asarray(mesh.vertices[unique_vid], dtype=float)
+    centroids = tri.mean(axis=1)
+    mid01 = 0.5 * (tri[:, 0, :] + tri[:, 1, :])
+    mid12 = 0.5 * (tri[:, 1, :] + tri[:, 2, :])
+    mid20 = 0.5 * (tri[:, 2, :] + tri[:, 0, :])
+
+    return np.vstack([verts, centroids, mid01, mid12, mid20])
+
+
+def _prepare_patch_sample_cache(mesh: trimesh.Trimesh, patch_faces: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
+    """
+    Build per-patch sample-point cache once to avoid repeated submesh extraction/sampling
+    during feasibility loop.
+    """
+    cache: Dict[int, np.ndarray] = {}
+    if mesh is None or len(mesh.faces) == 0:
+        return cache
+
+    for pid, fidx in patch_faces.items():
+        cache[int(pid)] = _build_patch_sample_points_from_faces(mesh, fidx)
+    return cache
+
+
+def _extract_outer_contact_points(
+    contact_points: np.ndarray,
+    world_from_pad: Optional[np.ndarray] = None,
+    pad_from_world: Optional[np.ndarray] = None,
+    max_points: int = 0,
+) -> np.ndarray:
+    """
+    Keep only outermost points in pad-plane 2D (convex hull vertices),
+    and optionally downsample to at most `max_points`.
+    """
+    pts = np.asarray(contact_points, dtype=float)
+    if pts.ndim == 1:
+        pts = pts.reshape(-1, 3)
+    if len(pts) <= 3:
+        return pts
+
+    if pad_from_world is None:
+        if world_from_pad is None:
+            return pts
+        try:
+            pad_from_world = np.linalg.inv(world_from_pad)
+        except np.linalg.LinAlgError:
+            return pts
+
+    local_pts = trimesh.transform_points(pts, pad_from_world)
+    uv = np.asarray(local_pts[:, :2], dtype=float)
+    if len(uv) <= 3:
+        return pts
+
+    # Remove duplicate 2D points first
+    _, unique_idx = np.unique(np.round(uv, 6), axis=0, return_index=True)
+    unique_idx = np.sort(unique_idx)
+    if len(unique_idx) <= 3:
+        return pts[unique_idx]
+
+    uv_unique = uv[unique_idx]
+    try:
+        hull = ConvexHull(uv_unique, qhull_options="QJ")
+        hull_idx = unique_idx[hull.vertices]
+        hull_idx = np.unique(hull_idx)
+        outer = pts[hull_idx]
+    except Exception:
+        outer = pts[unique_idx]
+
+    if int(max_points) > 0 and len(outer) > int(max_points):
+        local_outer = trimesh.transform_points(outer, pad_from_world)
+        uv_outer = np.asarray(local_outer[:, :2], dtype=float)
+        c2 = uv_outer.mean(axis=0, keepdims=True)
+        rel = uv_outer - c2
+        ang = np.arctan2(rel[:, 1], rel[:, 0])
+        rad = np.linalg.norm(rel, axis=1)
+
+        bins = np.linspace(-np.pi, np.pi, int(max_points) + 1)
+        chosen: List[int] = []
+        used = np.zeros(len(outer), dtype=bool)
+
+        for bi in range(int(max_points)):
+            lo, hi = bins[bi], bins[bi + 1]
+            in_bin = (ang >= lo) & (ang < hi if bi < int(max_points) - 1 else ang <= hi)
+            cand = np.where(in_bin)[0]
+            if len(cand) == 0:
+                continue
+            pick = cand[int(np.argmax(rad[cand]))]
+            if not used[pick]:
+                chosen.append(int(pick))
+                used[pick] = True
+
+        if len(chosen) < int(max_points):
+            remain = np.where(~used)[0]
+            if len(remain) > 0:
+                order = remain[np.argsort(-rad[remain])]
+                need = int(max_points) - len(chosen)
+                chosen.extend(order[:need].astype(int).tolist())
+
+        if len(chosen) > 0:
+            outer = outer[np.asarray(chosen, dtype=np.int64)]
+
+    return outer
+
+
 def get_points_in_squeezed_pad(mesh, patch_info, 
                                pad_w, pad_h, pad_d, 
                                yaw_deg=0.0, 
                                squeeze_depth=0.1, 
+                               sample_points: Optional[np.ndarray] = None,
+                               max_outer_points: int = 8,
                             #    sample_count=100 # sample_surface 사용시
     ):
     """
     패드를 물체 안쪽으로 squeeze_depth만큼 밀어넣었을 때,
     패드 영역 안에 포함되는 물체 표면의 점들을 반환
     """
-    # 1. Build candidate sample points on patch submesh
-    samples = _build_patch_sample_points(mesh)
+    # 1. Candidate sample points
+    if sample_points is None:
+        samples = _build_patch_sample_points(mesh)
+    else:
+        samples = np.asarray(sample_points, dtype=float)
+        if samples.ndim == 1:
+            samples = samples.reshape(-1, 3)
 
     if len(samples) == 0:
         return np.array([]), None   
 
     # 2. 패드 박스(OBB) 생성
-    pad_box = trimesh.creation.box(extents=[pad_w, pad_h, pad_d])
+    extents = np.array([float(pad_w), float(pad_h), float(pad_d)], dtype=float)
+    half_extents = 0.5 * extents
+    pad_box = trimesh.creation.box(extents=extents)
     
     # 패치 정보
     c = np.asarray(patch_info["centroid"])
@@ -1541,9 +1802,20 @@ def get_points_in_squeezed_pad(mesh, patch_info,
     final_pose = T @ R_align @ R_yaw
     pad_box.apply_transform(final_pose)
     
-    # 4. 포함 여부 검사 (Points inside Box): samples 점들이 pad_box 안에 있는지 확인
-    is_inside = pad_box.contains(samples)
+    # 4. 포함 여부 검사 (Points inside OBB)
+    # Faster than mesh.contains for box geometry: transform samples to local box frame.
+    try:
+        pad_from_world = np.linalg.inv(final_pose)
+    except np.linalg.LinAlgError:
+        pad_from_world = np.eye(4)
+    local_samples = trimesh.transform_points(samples, pad_from_world)
+    is_inside = np.all(np.abs(local_samples) <= (half_extents.reshape(1, 3) + 1e-9), axis=1)
     contact_points = samples[is_inside]
+    contact_points = _extract_outer_contact_points(
+        contact_points,
+        pad_from_world=pad_from_world,
+        max_points=int(max_outer_points),
+    )
     
     return contact_points, pad_box # 시각화를 위해 pad_box도 반환
 
@@ -1554,6 +1826,11 @@ def calculate_squeeze_epsilon_quality(mesh, f_i_idx, f_j_idx, c_i, n_i, yaw_i, c
                                       squeeze_depth=0.1, # mm 단위 접촉 면 깊이
                                       mu=PadParams.mu,
                                       k=8,
+                                      patch_i_samples: Optional[np.ndarray] = None,
+                                      patch_j_samples: Optional[np.ndarray] = None,
+                                      ch_len: Optional[float] = None,
+                                      sampling_mesh: Optional[trimesh.Trimesh] = None,
+                                      max_contact_points_per_pad: int = 8,
     # 해당 패치 근처의 face들만 서브셋으로 뽑아서 샘플링하면 더 빠름 (여기서는 전체 메쉬 사용 예시)
     # 최적화를 위해 mesh.submesh([patch_face_indices]) 사용 권장
                                       ):
@@ -1562,27 +1839,49 @@ def calculate_squeeze_epsilon_quality(mesh, f_i_idx, f_j_idx, c_i, n_i, yaw_i, c
     겹치는 영역의 점들을 사용하여 GWS 및 Epsilon Quality를 계산
     """
 
-    # 1. 접촉점 추출 (Points containment)
-    # f_i_idx / f_j_idx are expected to be patch face-index sets.
-    patch_i_faces = np.unique(np.atleast_1d(np.asarray(f_i_idx, dtype=np.int64)))
-    patch_j_faces = np.unique(np.atleast_1d(np.asarray(f_j_idx, dtype=np.int64)))
-    if len(patch_i_faces) == 0 or len(patch_j_faces) == 0:
-        return 0.0
+    # 1. Contact-point extraction
+    mesh_for_sampling = sampling_mesh if sampling_mesh is not None else mesh
+    if patch_i_samples is None or patch_j_samples is None:
+        # f_i_idx / f_j_idx are expected to be patch face-index sets on mesh_for_sampling.
+        patch_i_faces = _sanitize_face_index_array(np.asarray(f_i_idx, dtype=np.int64), len(mesh_for_sampling.faces))
+        patch_j_faces = _sanitize_face_index_array(np.asarray(f_j_idx, dtype=np.int64), len(mesh_for_sampling.faces))
+        if len(patch_i_faces) == 0 or len(patch_j_faces) == 0:
+            return 0.0
 
-    # Patch I/J submeshes (patch-level, not single-face-level)
-    mesh_i = mesh.submesh([patch_i_faces], append=True)
-    pts_i, _ = get_points_in_squeezed_pad(mesh_i, {"centroid": c_i, "normal": n_i}, 
-                                          pad_w, pad_h, pad_d, yaw_i, squeeze_depth)    
-    mesh_j = mesh.submesh([patch_j_faces], append=True)
-    pts_j, _ = get_points_in_squeezed_pad(mesh_j, {"centroid": c_j, "normal": n_j}, 
-                                          pad_w, pad_h, pad_d, yaw_j, squeeze_depth)
+        # Patch-level sampling directly from face sets (no submesh build)
+        patch_i_samples = _build_patch_sample_points_from_faces(mesh_for_sampling, patch_i_faces)
+        patch_j_samples = _build_patch_sample_points_from_faces(mesh_for_sampling, patch_j_faces)
+
+    pts_i, _ = get_points_in_squeezed_pad(
+        mesh,
+        {"centroid": c_i, "normal": n_i},
+        pad_w,
+        pad_h,
+        pad_d,
+        yaw_i,
+        squeeze_depth,
+        sample_points=patch_i_samples,
+        max_outer_points=int(max_contact_points_per_pad),
+    )
+    pts_j, _ = get_points_in_squeezed_pad(
+        mesh,
+        {"centroid": c_j, "normal": n_j},
+        pad_w,
+        pad_h,
+        pad_d,
+        yaw_j,
+        squeeze_depth,
+        sample_points=patch_j_samples,
+        max_outer_points=int(max_contact_points_per_pad),
+    )
 
     # 접촉점 검사
     if len(pts_i) == 0 or len(pts_j) == 0: # 접촉점이 없는 경우 Grasping 없음
         return 0.0
 
     # 힘은 물체를 미는 방향이므로 -normal
-    ch_len = 0.5 * float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])) # RWS Characteristic Length = Radius 스케일링
+    if ch_len is None:
+        ch_len = 0.5 * float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])) # RWS Characteristic Length = Radius 스케일링
 
     wrenches_i = add_wrenches(pts_i, -n_i, com, ch_len, mu=mu, k=k)
     wrenches_j = add_wrenches(pts_j, -n_j, com, ch_len, mu=mu, k=k)
