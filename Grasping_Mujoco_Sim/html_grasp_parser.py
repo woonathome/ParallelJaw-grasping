@@ -54,18 +54,38 @@ def _infer_default_mesh_root(html_path: Path) -> Path:
             cand = parent.parent / "models_target" / "models_cad"
             if cand.exists():
                 return cand
+    repo_default = (Path(__file__).resolve().parent.parent / "models_target" / "models_cad").resolve()
+    if repo_default.exists():
+        return repo_default
     return (Path.cwd() / "models_target" / "models_cad").resolve()
 
 
 def _extract_object_name_from_html_filename(path: Path) -> str:
     stem = path.stem
-    m = re.match(r"1-grasping_pairs_feasible_(.+?)_\d+sol$", stem)
+    m = re.search(r"(?:^|__)1-grasping_pairs_feasible_(.+?)_\d+sol$", stem)
     if m:
         return m.group(1)
-    m2 = re.match(r"1-grasping_pairs_feasible_(.+)$", stem)
+    m2 = re.search(r"(?:^|__)1-grasping_pairs_feasible_(.+)$", stem)
     if m2:
         return m2.group(1)
     raise ValueError(f"Could not parse object key from HTML filename: {path.name}")
+
+
+def _extract_category_hint_from_html_filename(path: Path) -> str | None:
+    stem = path.stem
+    m = re.match(r"([A-Za-z0-9_]+)__1-grasping_pairs_feasible_", stem)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _extract_category_from_html_path(path: Path) -> str:
+    parts = list(path.resolve().parts)
+    if "Grasping_Results_SurfaceContact" in parts:
+        idx = parts.index("Grasping_Results_SurfaceContact")
+        if idx + 1 < len(parts):
+            return str(parts[idx + 1])
+    return path.parent.name
 
 
 def _resolve_external_mesh_path(
@@ -73,26 +93,77 @@ def _resolve_external_mesh_path(
     html_path: Path,
     mesh_root: str | Path | None,
 ) -> Path:
-    root = _infer_default_mesh_root(html_path) if mesh_root is None else Path(mesh_root).resolve()
-    category = html_path.parent.name
+    if mesh_root is None:
+        root = _infer_default_mesh_root(html_path)
+    else:
+        root_in = Path(mesh_root)
+        if root_in.is_absolute():
+            root = root_in.resolve()
+        else:
+            cwd_candidate = (Path.cwd() / root_in).resolve()
+            repo_candidate = (Path(__file__).resolve().parent.parent / root_in).resolve()
+            if cwd_candidate.exists():
+                root = cwd_candidate
+            elif repo_candidate.exists():
+                root = repo_candidate
+            else:
+                root = cwd_candidate
+
+    category = _extract_category_from_html_path(html_path)
     obj_key = _extract_object_name_from_html_filename(html_path)
+    candidate_dirs: List[Path] = []
+
     cat_dir = root / category
-    if not cat_dir.exists():
-        raise ValueError(f"Mesh category folder not found: {cat_dir}")
+    if cat_dir.exists():
+        candidate_dirs.append(cat_dir)
 
+    cat_hint = _extract_category_hint_from_html_filename(html_path)
+    if cat_hint:
+        hint_dir = root / cat_hint
+        if hint_dir.exists() and hint_dir not in candidate_dirs:
+            candidate_dirs.append(hint_dir)
+
+    for cdir in candidate_dirs:
+        for ext in (".ply", ".obj"):
+            cand = cdir / f"{obj_key}{ext}"
+            if cand.exists():
+                return cand
+        fuzzy = sorted(
+            p for p in cdir.glob(f"{obj_key}.*") if p.suffix.lower() in {".ply", ".obj"}
+        )
+        if fuzzy:
+            return fuzzy[0]
+
+    exact_matches: List[Path] = []
     for ext in (".ply", ".obj"):
-        cand = cat_dir / f"{obj_key}{ext}"
-        if cand.exists():
-            return cand
+        exact_matches.extend(root.rglob(f"{obj_key}{ext}"))
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        for cdir in candidate_dirs:
+            for p in exact_matches:
+                try:
+                    p.relative_to(cdir)
+                    return p
+                except Exception:
+                    continue
+        return sorted(exact_matches)[0]
 
-    fuzzy = sorted(
-        p for p in cat_dir.glob(f"{obj_key}.*") if p.suffix.lower() in {".ply", ".obj"}
+    pref_matches = sorted(
+        p for p in root.rglob(f"{obj_key}*") if p.suffix.lower() in {".ply", ".obj"}
     )
-    if fuzzy:
-        return fuzzy[0]
+    if pref_matches:
+        for cdir in candidate_dirs:
+            for p in pref_matches:
+                try:
+                    p.relative_to(cdir)
+                    return p
+                except Exception:
+                    continue
+        return pref_matches[0]
 
     raise ValueError(
-        f"Could not find mesh file for '{obj_key}' in '{cat_dir}' (.ply/.obj expected)."
+        f"Could not find mesh file for '{obj_key}' under root '{root}'. (.ply/.obj expected)"
     )
 
 
@@ -106,18 +177,17 @@ def _load_external_mesh(
     try:
         import trimesh  # type: ignore
     except Exception as exc:
-        raise RuntimeError(
-            "trimesh is required to load external obj/ply meshes."
-        ) from exc
+        raise RuntimeError("trimesh is required to load external obj/ply meshes.") from exc
 
     loaded = trimesh.load_mesh(str(mesh_path), process=False)
     if isinstance(loaded, trimesh.Scene):
-        geom = [g for g in loaded.geometry.values() if hasattr(g, "vertices") and hasattr(g, "faces")]
-        if not geom:
+        geoms = [g for g in loaded.geometry.values() if hasattr(g, "vertices") and hasattr(g, "faces")]
+        if not geoms:
             raise ValueError(f"Scene mesh has no valid geometry: {mesh_path}")
-        mesh = trimesh.util.concatenate(geom)
+        mesh = trimesh.util.concatenate(geoms)
     else:
         mesh = loaded
+
     vertices = np.asarray(mesh.vertices, dtype=float) * float(unit_scale)
     faces = np.asarray(mesh.faces, dtype=np.int64)
     if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) == 0:
@@ -282,18 +352,61 @@ def _decode_mesh_trace(object_mesh: Dict[str, Any], unit_scale: float) -> tuple[
     return mesh_vertices, mesh_faces
 
 
+def _is_watertight_mesh(vertices: np.ndarray, faces: np.ndarray) -> bool:
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) == 0:
+        return False
+    if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
+        return False
+    try:
+        import trimesh  # type: ignore
+    except Exception:
+        return False
+    try:
+        mesh = trimesh.Trimesh(
+            vertices=np.asarray(vertices, dtype=float),
+            faces=np.asarray(faces, dtype=np.int64),
+            process=False,
+            validate=False,
+        )
+        return bool(mesh.is_watertight)
+    except Exception:
+        return False
+
+
+def _align_external_mesh_to_html_frame(
+    external_vertices: np.ndarray,
+    html_vertices: np.ndarray,
+) -> np.ndarray:
+    ext = np.asarray(external_vertices, dtype=float)
+    ref = np.asarray(html_vertices, dtype=float)
+    if (ext.shape[0] < 4) or (ref.shape[0] < 4):
+        return ext
+
+    ext_extent = np.ptp(ext, axis=0)
+    ref_extent = np.ptp(ref, axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.median(ref_extent / np.maximum(ext_extent, 1e-12))
+    if (not np.isfinite(ratio)) or (ratio <= 0.0):
+        ratio = 1.0
+    ratio = float(np.clip(ratio, 1e-4, 1e4))
+
+    # Keep it simple: no ICP/iterative fitting.
+    # Use only uniform scale + centroid alignment to map original mesh to HTML frame.
+    aligned = ext * ratio
+    aligned += (np.mean(ref, axis=0) - np.mean(aligned, axis=0))[None, :]
+    return aligned
+
+
 def _collect_pair_marker_traces(traces: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    markers: List[tuple[int, int, Dict[str, Any]]] = []
-    for order, tr in enumerate(traces):
+    markers: List[Dict[str, Any]] = []
+    for tr in traces:
         name = str(tr.get("name", ""))
         mode = str(tr.get("mode", ""))
         if tr.get("type") != "scatter3d" or "markers" not in mode or not name.startswith("pair "):
             continue
-        m = re.match(r"pair\s+(\d+)\b", name)
-        pidx = int(m.group(1)) if m else 10**9
-        markers.append((pidx, order, tr))
-    markers.sort(key=lambda x: (x[0], x[1]))
-    return [m[2] for m in markers]
+        markers.append(tr)
+    # Keep original Plotly trace order: this is the ranked order in the HTML.
+    return markers
 
 
 def _collect_legend_aux_traces(traces: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -416,11 +529,22 @@ def parse_ranked_grasp_candidates_from_html(
     path = Path(html_path)
     html_text = path.read_text(encoding="utf-8", errors="ignore")
     traces = _load_plotly_traces(html_text)
-    mesh_vertices, mesh_faces = _load_external_mesh(
-        html_path=path,
-        unit_scale=unit_scale,
-        mesh_root=mesh_root,
-    )
+    # Pad/contact/approach information always comes from HTML traces.
+    # Object geometry policy:
+    # 1) Use HTML mesh when it is watertight.
+    # 2) Otherwise fallback to original mesh path and align to HTML frame.
+    object_mesh = _select_object_mesh_trace(traces)
+    html_mesh_vertices, html_mesh_faces = _decode_mesh_trace(object_mesh, unit_scale)
+    if _is_watertight_mesh(html_mesh_vertices, html_mesh_faces):
+        mesh_vertices = html_mesh_vertices
+        mesh_faces = html_mesh_faces
+    else:
+        mesh_vertices, mesh_faces = _load_external_mesh(
+            html_path=path,
+            unit_scale=unit_scale,
+            mesh_root=mesh_root,
+        )
+        mesh_vertices = _align_external_mesh_to_html_frame(mesh_vertices, html_mesh_vertices)
     markers = _collect_pair_marker_traces(traces)
     legend_aux = _collect_legend_aux_traces(traces)
 

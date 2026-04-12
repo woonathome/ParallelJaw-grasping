@@ -35,9 +35,10 @@ class SimConfig:
     object_collision_scale: float = 0.96
     contact_penetration_threshold: float = 5e-5
     object_collision_mode: str = "auto"  # mesh | surface_spheres | auto
-    object_collision_auto_hull_ratio_threshold: float = 1.6
+    object_collision_auto_hull_ratio_threshold: float = 1.15
+    object_collision_auto_use_spheres_when_hull_unknown: bool = True
     object_collision_sphere_count: int = 180
-    object_collision_sphere_radius_scale: float = 0.7
+    object_collision_sphere_radius_scale: float = 0.55
     object_collision_sphere_min_radius: float = 4e-4
     object_collision_sphere_max_radius: float = 6e-3
     lock_object_until_dual_contact: bool = True
@@ -50,6 +51,7 @@ class SimConfig:
 
     # Initial opening and closing behavior (meter)
     pre_clearance: float = 0.002
+    approach_start_extra_gap: float = 0.015
     squeeze_extra: float = 0.0015
     close_ramp: bool = True
     require_dual_contact: bool = True
@@ -76,9 +78,9 @@ class SimConfig:
     opening_retry_step: float = 0.004
     max_initial_opening_extra: float = 0.05
     max_opening_retries: int = 8
-    enable_pair_fallback: bool = True
+    enable_pair_fallback: bool = False
     pair_fallback_max_candidates: int = 64
-    auto_pair_rescue_on_no_contact: bool = True
+    auto_pair_rescue_on_no_contact: bool = False
     auto_pair_rescue_max_candidates: int = 64
     auto_pair_rescue_require_thin_support: bool = True
 
@@ -101,7 +103,6 @@ class SimConfig:
 
     # Parse scale: HTML(mm) -> MuJoCo(m)
     unit_scale: float = 1e-3
-    mesh_root: str | None = None
 
     # Mesh cache
     cache_dir: str = "Grasping_Mujoco_Sim/.cache"
@@ -360,7 +361,10 @@ def _build_mjcf(
 ) -> tuple[str, Dict[str, Any]]:
     grasp, prep_info = _prepare_grasp_for_parallel_jaw(grasp, cfg)
     depth_dist = float(np.linalg.norm(grasp.contact_j - grasp.contact_i))
-    initial_gap = max(depth_dist + 2.0 * cfg.pre_clearance + float(opening_extra), cfg.pad_depth + 0.002)
+    initial_gap = max(
+        depth_dist + 2.0 * cfg.pre_clearance + float(cfg.approach_start_extra_gap) + float(opening_extra),
+        cfg.pad_depth + 0.002,
+    )
     # Give generous over-travel margin for objects where HTML pair distance
     # underestimates local thickness around the actual pad contact region.
     joint_max = max(0.002, initial_gap * 0.72)
@@ -397,14 +401,20 @@ def _build_mjcf(
     if requested_mode not in {"mesh", "surface_spheres", "auto"}:
         requested_mode = "auto"
     hull_ratio = _estimate_convex_hull_ratio(grasp.mesh_vertices, grasp.mesh_faces)
+    auto_reason = "forced"
     if requested_mode == "surface_spheres":
         use_surface_spheres = True
     elif requested_mode == "mesh":
         use_surface_spheres = False
     else:
-        use_surface_spheres = bool(
-            (hull_ratio is not None) and (hull_ratio >= float(cfg.object_collision_auto_hull_ratio_threshold))
-        )
+        if hull_ratio is None:
+            use_surface_spheres = bool(cfg.object_collision_auto_use_spheres_when_hull_unknown)
+            auto_reason = "hull_ratio_unknown"
+        else:
+            use_surface_spheres = bool(
+                hull_ratio >= float(cfg.object_collision_auto_hull_ratio_threshold)
+            )
+            auto_reason = "hull_ratio_threshold"
 
     sphere_count = 0
     sphere_radius = 0.0
@@ -489,10 +499,13 @@ def _build_mjcf(
         "tighten_cap": tighten_cap,
         "is_thin_support": bool(is_thin_support),
         "opening_extra_m": float(opening_extra),
+        "approach_start_extra_gap_m": float(cfg.approach_start_extra_gap),
         "pad_collision_scale": float(pad_collision_scale),
         "object_collision_scale": float(obj_collision_scale),
         "contact_margin": float(contact_margin),
         "object_collision_mode": str(effective_mode),
+        "object_collision_auto_reason": str(auto_reason),
+        "object_collision_auto_threshold": float(cfg.object_collision_auto_hull_ratio_threshold),
         "object_convex_hull_ratio": float(hull_ratio) if hull_ratio is not None else None,
         "object_collision_proxy_count": int(sphere_count),
         "object_collision_proxy_radius_m": float(sphere_radius),
@@ -1085,6 +1098,8 @@ def _run_simulation_core(
         "pad_collision_scale": inner.get("pad_collision_scale"),
         "object_collision_scale": inner.get("object_collision_scale"),
         "object_collision_mode": inner.get("object_collision_mode"),
+        "object_collision_auto_reason": inner.get("object_collision_auto_reason"),
+        "object_collision_auto_threshold": inner.get("object_collision_auto_threshold"),
         "object_convex_hull_ratio": inner.get("object_convex_hull_ratio"),
         "object_collision_proxy_count": int(inner.get("object_collision_proxy_count", 0)),
         "object_collision_proxy_radius_m": inner.get("object_collision_proxy_radius_m"),
@@ -1244,7 +1259,6 @@ def _select_best_grasp_candidate_from_html(
         html_path=html_path,
         unit_scale=cfg.unit_scale,
         max_candidates=1,
-        mesh_root=cfg.mesh_root,
     )
     best_rank = 0
     tested = 1
@@ -1264,7 +1278,6 @@ def _select_best_grasp_candidate_from_html(
             html_path=html_path,
             unit_scale=cfg.unit_scale,
             max_candidates=scan_cap,
-            mesh_root=cfg.mesh_root,
         )
         used_limit = int(scan_cap)
         for rank, cand in enumerate(scan_candidates[1:], start=1):
@@ -1303,11 +1316,7 @@ def play_in_viewer_from_html(
     show_contact_forces: bool = False,
 ) -> Dict[str, Any]:
     cfg = cfg or SimConfig()
-    parsed = parse_top_grasp_from_html(
-        html_path,
-        unit_scale=cfg.unit_scale,
-        mesh_root=cfg.mesh_root,
-    )
+    parsed = parse_top_grasp_from_html(html_path, unit_scale=cfg.unit_scale)
     return play_in_viewer_from_parsed_grasp(
         parsed,
         cfg=cfg,
@@ -1500,14 +1509,16 @@ def run_from_html(
     object_collision_scale: float = 0.96,
     contact_penetration_threshold: float = 5e-5,
     object_collision_mode: str = "auto",
-    object_collision_auto_hull_ratio_threshold: float = 1.6,
+    object_collision_auto_hull_ratio_threshold: float = 1.15,
+    object_collision_auto_use_spheres_when_hull_unknown: bool = True,
     object_collision_sphere_count: int = 180,
-    object_collision_sphere_radius_scale: float = 0.7,
+    object_collision_sphere_radius_scale: float = 0.55,
     object_collision_sphere_min_radius: float = 4e-4,
     object_collision_sphere_max_radius: float = 6e-3,
     lock_object_until_dual_contact: bool = True,
     force_unlock_before_perturb: bool = True,
     pre_clearance: float = 0.002,
+    approach_start_extra_gap: float = 0.008,
     squeeze_extra: float = 0.0015,
     require_dual_contact: bool = True,
     tighten_step: float = 0.001,
@@ -1529,12 +1540,11 @@ def run_from_html(
     opening_retry_step: float = 0.004,
     max_initial_opening_extra: float = 0.05,
     max_opening_retries: int = 8,
-    enable_pair_fallback: bool = True,
+    enable_pair_fallback: bool = False,
     pair_fallback_max_candidates: int = 64,
-    auto_pair_rescue_on_no_contact: bool = True,
+    auto_pair_rescue_on_no_contact: bool = False,
     auto_pair_rescue_max_candidates: int = 64,
     auto_pair_rescue_require_thin_support: bool = True,
-    mesh_root: Optional[str] = None,
     perturb_time: float = 0.08,
     hold_time: float = 0.08,
     open_viewer: bool = False,
@@ -1551,7 +1561,6 @@ def run_from_html(
     record_split_dual_view: bool = True,
     record_opposite_azimuth_offset: float = 180.0,
     record_camera_track_object: bool = False,
-    **_unused_kwargs: Any,
 ) -> Dict[str, Any]:
     cfg = SimConfig(
         depth_speed=depth_speed,
@@ -1566,6 +1575,7 @@ def run_from_html(
         contact_penetration_threshold=contact_penetration_threshold,
         object_collision_mode=object_collision_mode,
         object_collision_auto_hull_ratio_threshold=object_collision_auto_hull_ratio_threshold,
+        object_collision_auto_use_spheres_when_hull_unknown=object_collision_auto_use_spheres_when_hull_unknown,
         object_collision_sphere_count=object_collision_sphere_count,
         object_collision_sphere_radius_scale=object_collision_sphere_radius_scale,
         object_collision_sphere_min_radius=object_collision_sphere_min_radius,
@@ -1573,6 +1583,7 @@ def run_from_html(
         lock_object_until_dual_contact=lock_object_until_dual_contact,
         force_unlock_before_perturb=force_unlock_before_perturb,
         pre_clearance=pre_clearance,
+        approach_start_extra_gap=approach_start_extra_gap,
         squeeze_extra=squeeze_extra,
         require_dual_contact=require_dual_contact,
         tighten_step=tighten_step,
@@ -1599,7 +1610,6 @@ def run_from_html(
         auto_pair_rescue_on_no_contact=auto_pair_rescue_on_no_contact,
         auto_pair_rescue_max_candidates=auto_pair_rescue_max_candidates,
         auto_pair_rescue_require_thin_support=auto_pair_rescue_require_thin_support,
-        mesh_root=mesh_root,
         perturb_time=perturb_time,
         hold_time=hold_time,
     )
