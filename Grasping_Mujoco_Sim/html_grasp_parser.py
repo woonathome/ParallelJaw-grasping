@@ -47,6 +47,86 @@ def _unit(v: np.ndarray, fallback: Sequence[float]) -> np.ndarray:
     return out / n
 
 
+def _infer_default_mesh_root(html_path: Path) -> Path:
+    p = html_path.resolve()
+    for parent in [p.parent] + list(p.parents):
+        if parent.name == "Grasping_Results_SurfaceContact":
+            cand = parent.parent / "models_target" / "models_cad"
+            if cand.exists():
+                return cand
+    return (Path.cwd() / "models_target" / "models_cad").resolve()
+
+
+def _extract_object_name_from_html_filename(path: Path) -> str:
+    stem = path.stem
+    m = re.match(r"1-grasping_pairs_feasible_(.+?)_\d+sol$", stem)
+    if m:
+        return m.group(1)
+    m2 = re.match(r"1-grasping_pairs_feasible_(.+)$", stem)
+    if m2:
+        return m2.group(1)
+    raise ValueError(f"Could not parse object key from HTML filename: {path.name}")
+
+
+def _resolve_external_mesh_path(
+    *,
+    html_path: Path,
+    mesh_root: str | Path | None,
+) -> Path:
+    root = _infer_default_mesh_root(html_path) if mesh_root is None else Path(mesh_root).resolve()
+    category = html_path.parent.name
+    obj_key = _extract_object_name_from_html_filename(html_path)
+    cat_dir = root / category
+    if not cat_dir.exists():
+        raise ValueError(f"Mesh category folder not found: {cat_dir}")
+
+    for ext in (".ply", ".obj"):
+        cand = cat_dir / f"{obj_key}{ext}"
+        if cand.exists():
+            return cand
+
+    fuzzy = sorted(
+        p for p in cat_dir.glob(f"{obj_key}.*") if p.suffix.lower() in {".ply", ".obj"}
+    )
+    if fuzzy:
+        return fuzzy[0]
+
+    raise ValueError(
+        f"Could not find mesh file for '{obj_key}' in '{cat_dir}' (.ply/.obj expected)."
+    )
+
+
+def _load_external_mesh(
+    *,
+    html_path: Path,
+    unit_scale: float,
+    mesh_root: str | Path | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    mesh_path = _resolve_external_mesh_path(html_path=html_path, mesh_root=mesh_root)
+    try:
+        import trimesh  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "trimesh is required to load external obj/ply meshes."
+        ) from exc
+
+    loaded = trimesh.load_mesh(str(mesh_path), process=False)
+    if isinstance(loaded, trimesh.Scene):
+        geom = [g for g in loaded.geometry.values() if hasattr(g, "vertices") and hasattr(g, "faces")]
+        if not geom:
+            raise ValueError(f"Scene mesh has no valid geometry: {mesh_path}")
+        mesh = trimesh.util.concatenate(geom)
+    else:
+        mesh = loaded
+    vertices = np.asarray(mesh.vertices, dtype=float) * float(unit_scale)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) == 0:
+        raise ValueError(f"Invalid mesh vertices from: {mesh_path}")
+    if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
+        raise ValueError(f"Invalid mesh faces from: {mesh_path}")
+    return vertices, faces
+
+
 def _decode_plotly_array(arr: Any) -> np.ndarray:
     if isinstance(arr, dict) and "bdata" in arr and "dtype" in arr:
         dtype_code = str(arr["dtype"]).strip()
@@ -164,33 +244,32 @@ def _principal_axes_from_pad(pad_points: np.ndarray, depth_axis: np.ndarray) -> 
     return width_axis, height_axis
 
 
-def parse_top_grasp_from_html(html_path: str | Path, unit_scale: float = 1e-3) -> TopGraspData:
-    """
-    Parse a feasible-grasp Plotly HTML and extract:
-    - object mesh (first large mesh trace)
-    - top-ranked grasp pair (first `pair ...` marker trace)
-    - 3 local grasp axes (depth/width/height)
+def _is_pad_mesh(tr: Dict[str, Any]) -> bool:
+    tr_name = str(tr.get("name", "")).lower()
+    return ("pad_i" in tr_name) or ("pad_j" in tr_name)
 
-    `unit_scale=1e-3` converts mm (grasp output) -> m (MuJoCo).
-    """
-    path = Path(html_path)
-    html_text = path.read_text(encoding="utf-8", errors="ignore")
-    traces = _load_plotly_traces(html_text)
 
+def _select_object_mesh_trace(traces: List[Dict[str, Any]]) -> Dict[str, Any]:
     mesh_candidates: List[Dict[str, Any]] = []
     for tr in traces:
         if tr.get("type") != "mesh3d":
             continue
         if not all(k in tr for k in ("x", "y", "z", "i", "j", "k")):
             continue
-        vx = _decode_plotly_array(tr["x"])
-        if len(vx) >= 30:
-            mesh_candidates.append(tr)
+        mesh_candidates.append(tr)
     if not mesh_candidates:
         raise ValueError("Could not find object mesh trace in HTML.")
 
-    object_mesh = max(mesh_candidates, key=lambda t: len(_decode_plotly_array(t["x"])))
+    non_pad = [tr for tr in mesh_candidates if not _is_pad_mesh(tr)]
+    root_mesh = [tr for tr in non_pad if not str(tr.get("legendgroup", "")).strip()]
+    if root_mesh:
+        return max(root_mesh, key=lambda t: len(_decode_plotly_array(t["x"])))
+    if non_pad:
+        return max(non_pad, key=lambda t: len(_decode_plotly_array(t["x"])))
+    return max(mesh_candidates, key=lambda t: len(_decode_plotly_array(t["x"])))
 
+
+def _decode_mesh_trace(object_mesh: Dict[str, Any], unit_scale: float) -> tuple[np.ndarray, np.ndarray]:
     vx = _decode_plotly_array(object_mesh["x"]).astype(float) * unit_scale
     vy = _decode_plotly_array(object_mesh["y"]).astype(float) * unit_scale
     vz = _decode_plotly_array(object_mesh["z"]).astype(float) * unit_scale
@@ -200,83 +279,115 @@ def parse_top_grasp_from_html(html_path: str | Path, unit_scale: float = 1e-3) -
     fj = _decode_plotly_array(object_mesh["j"]).astype(np.int64)
     fk = _decode_plotly_array(object_mesh["k"]).astype(np.int64)
     mesh_faces = np.column_stack((fi, fj, fk))
+    return mesh_vertices, mesh_faces
 
-    top_marker = None
-    best_pair_idx = None
-    for tr in traces:
+
+def _collect_pair_marker_traces(traces: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    markers: List[tuple[int, int, Dict[str, Any]]] = []
+    for order, tr in enumerate(traces):
         name = str(tr.get("name", ""))
         mode = str(tr.get("mode", ""))
-        if tr.get("type") == "scatter3d" and "markers" in mode and name.startswith("pair "):
-            m = re.match(r"pair\s+(\d+)\b", name)
-            pidx = int(m.group(1)) if m else 10**9
-            if top_marker is None or pidx < best_pair_idx:
-                top_marker = tr
-                best_pair_idx = pidx
-    if top_marker is None:
-        raise ValueError("Could not find top grasp pair marker trace in HTML.")
+        if tr.get("type") != "scatter3d" or "markers" not in mode or not name.startswith("pair "):
+            continue
+        m = re.match(r"pair\s+(\d+)\b", name)
+        pidx = int(m.group(1)) if m else 10**9
+        markers.append((pidx, order, tr))
+    markers.sort(key=lambda x: (x[0], x[1]))
+    return [m[2] for m in markers]
 
-    pair_name = str(top_marker.get("name", "pair 0"))
-    legend_group = str(top_marker.get("legendgroup", pair_name))
-    marker_pts = _to_points_xyz(top_marker, unit_scale)
+
+def _collect_legend_aux_traces(traces: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    aux: Dict[str, Dict[str, Any]] = {}
+    for tr in traces:
+        lg = str(tr.get("legendgroup", ""))
+        if not lg:
+            continue
+        ent = aux.setdefault(lg, {"pad_i": None, "pad_j": None, "centerline": None})
+        if tr.get("type") == "mesh3d":
+            tr_name = str(tr.get("name", "")).lower()
+            if "pad_i" in tr_name:
+                ent["pad_i"] = tr
+            elif "pad_j" in tr_name:
+                ent["pad_j"] = tr
+        elif tr.get("type") == "scatter3d":
+            mode = str(tr.get("mode", ""))
+            if ("lines" in mode) and ("centerline" in str(tr.get("name", "")).lower()):
+                ent["centerline"] = tr
+    return aux
+
+
+def _build_grasp_from_marker_trace(
+    *,
+    path: Path,
+    marker_trace: Dict[str, Any],
+    legend_aux: Dict[str, Dict[str, Any]],
+    mesh_vertices: np.ndarray,
+    mesh_faces: np.ndarray,
+    unit_scale: float,
+) -> TopGraspData:
+    pair_name = str(marker_trace.get("name", "pair 0"))
+    legend_group = str(marker_trace.get("legendgroup", pair_name))
+    marker_pts = _to_points_xyz(marker_trace, unit_scale)
     if len(marker_pts) == 0:
         raise ValueError("Top grasp marker trace has no valid point.")
-    contact_i = marker_pts[0]
+    marker_contact = marker_pts[0]
+    contact_i = marker_contact.copy()
+    contact_j = marker_contact.copy()
 
-    pad_i_trace = None
-    pad_j_trace = None
-    for tr in traces:
-        if tr.get("type") != "mesh3d":
-            continue
-        if str(tr.get("legendgroup", "")) != legend_group:
-            continue
-        tr_name = str(tr.get("name", "")).lower()
-        if "pad_i" in tr_name:
-            pad_i_trace = tr
-        elif "pad_j" in tr_name:
-            pad_j_trace = tr
+    ent = legend_aux.get(legend_group, {})
+    pad_i_trace = ent.get("pad_i")
+    pad_j_trace = ent.get("pad_j")
+    centerline_trace = ent.get("centerline")
+    pad_i_pts = _to_points_xyz(pad_i_trace, unit_scale) if pad_i_trace is not None else np.empty((0, 3), dtype=float)
+    pad_j_pts = _to_points_xyz(pad_j_trace, unit_scale) if pad_j_trace is not None else np.empty((0, 3), dtype=float)
+    pad_ci = np.mean(pad_i_pts, axis=0) if len(pad_i_pts) > 0 else None
+    pad_cj = np.mean(pad_j_pts, axis=0) if len(pad_j_pts) > 0 else None
 
-    if pad_i_trace is not None and pad_j_trace is not None:
-        pad_i_pts = _to_points_xyz(pad_i_trace, unit_scale)
-        pad_j_pts = _to_points_xyz(pad_j_trace, unit_scale)
-        if len(pad_i_pts) > 0 and len(pad_j_pts) > 0:
-            contact_i = np.mean(pad_i_pts, axis=0)
-            contact_j = np.mean(pad_j_pts, axis=0)
-        else:
-            contact_j = np.copy(contact_i)
-    else:
-        contact_j = np.copy(contact_i)
-
-    # Fallback to centerline if pad_i/pad_j-based contacts are not valid enough.
-    if float(np.linalg.norm(contact_j - contact_i)) < 1e-7:
-        centerline_trace = None
-        for tr in traces:
-            if tr.get("type") != "scatter3d":
-                continue
-            if str(tr.get("legendgroup", "")) != legend_group:
-                continue
-            mode = str(tr.get("mode", ""))
-            if "lines" not in mode:
-                continue
-            if "centerline" in str(tr.get("name", "")).lower():
-                centerline_trace = tr
-                break
-        if centerline_trace is None:
-            raise ValueError(f"Could not find centerline trace for legend group '{legend_group}'.")
-
+    # Prefer explicit centerline endpoints (closest endpoint to marker becomes contact_i).
+    used_centerline = False
+    if centerline_trace is not None:
         line_pts = _to_points_xyz(centerline_trace, unit_scale)
-        if len(line_pts) < 2:
-            raise ValueError("Centerline trace does not have enough valid points.")
+        if len(line_pts) >= 2:
+            p0 = line_pts[0]
+            p1 = line_pts[-1]
+            use_line = True
+            if (pad_ci is not None) and (pad_cj is not None):
+                d_pad = float(np.linalg.norm(pad_cj - pad_ci))
+                d_line = float(np.linalg.norm(p1 - p0))
+                # Some HTMLs encode centerline along pad thickness, not pad-to-pad axis.
+                # In that case, centerline is too short and/or orientation mismatches pad centroids.
+                if (d_pad > 1e-7) and (d_line > 1e-7):
+                    ratio = d_line / d_pad
+                    dir_line = _unit(p1 - p0, [1.0, 0.0, 0.0])
+                    dir_pad = _unit(pad_cj - pad_ci, [1.0, 0.0, 0.0])
+                    align = abs(float(np.dot(dir_line, dir_pad)))
+                    if (ratio < 0.45) or (ratio > 2.2) or (align < 0.65):
+                        use_line = False
+            if float(np.linalg.norm(p0 - marker_contact)) <= float(np.linalg.norm(p1 - marker_contact)):
+                if use_line:
+                    contact_i, contact_j = p0, p1
+                    used_centerline = True
+            else:
+                if use_line:
+                    contact_i, contact_j = p1, p0
+                    used_centerline = True
 
-        d0 = float(np.linalg.norm(line_pts[0] - contact_i))
-        d1 = float(np.linalg.norm(line_pts[-1] - contact_i))
-        contact_j = line_pts[-1] if d1 >= d0 else line_pts[0]
+    # Fallback: use pad centroids if centerline is unavailable/invalid.
+    if (not used_centerline) and (pad_ci is not None) and (pad_cj is not None):
+        if float(np.linalg.norm(pad_cj - pad_ci)) > 1e-7:
+            if float(np.linalg.norm(pad_ci - marker_contact)) <= float(np.linalg.norm(pad_cj - marker_contact)):
+                contact_i, contact_j = pad_ci, pad_cj
+            else:
+                contact_i, contact_j = pad_cj, pad_ci
+
+    if float(np.linalg.norm(contact_j - contact_i)) < 1e-7:
+        raise ValueError(f"Could not recover valid grasp line for legend group '{legend_group}'.")
 
     depth_axis = _unit(contact_j - contact_i, [1.0, 0.0, 0.0])
     grasp_center = 0.5 * (contact_i + contact_j)
 
-    if pad_i_trace is not None:
-        pad_points = _to_points_xyz(pad_i_trace, unit_scale)
-        width_axis, height_axis = _principal_axes_from_pad(pad_points, depth_axis)
+    if len(pad_i_pts) > 0:
+        width_axis, height_axis = _principal_axes_from_pad(pad_i_pts, depth_axis)
     else:
         width_axis = _unit(np.cross(depth_axis, np.array([0.0, 0.0, 1.0])), [0.0, 1.0, 0.0])
         height_axis = _unit(np.cross(depth_axis, width_axis), [0.0, 0.0, 1.0])
@@ -294,3 +405,62 @@ def parse_top_grasp_from_html(html_path: str | Path, unit_scale: float = 1e-3) -
         width_axis=width_axis,
         height_axis=height_axis,
     )
+
+
+def parse_ranked_grasp_candidates_from_html(
+    html_path: str | Path,
+    unit_scale: float = 1e-3,
+    max_candidates: int | None = None,
+    mesh_root: str | Path | None = None,
+) -> List[TopGraspData]:
+    path = Path(html_path)
+    html_text = path.read_text(encoding="utf-8", errors="ignore")
+    traces = _load_plotly_traces(html_text)
+    mesh_vertices, mesh_faces = _load_external_mesh(
+        html_path=path,
+        unit_scale=unit_scale,
+        mesh_root=mesh_root,
+    )
+    markers = _collect_pair_marker_traces(traces)
+    legend_aux = _collect_legend_aux_traces(traces)
+
+    out: List[TopGraspData] = []
+    limit = int(max_candidates) if max_candidates is not None else None
+    for marker in markers:
+        if limit is not None and len(out) >= limit:
+            break
+        try:
+            out.append(
+                _build_grasp_from_marker_trace(
+                    path=path,
+                    marker_trace=marker,
+                    legend_aux=legend_aux,
+                    mesh_vertices=mesh_vertices,
+                    mesh_faces=mesh_faces,
+                    unit_scale=unit_scale,
+                )
+            )
+        except Exception:
+            # Skip malformed individual traces and keep the parser robust.
+            continue
+    if not out:
+        raise ValueError("Could not recover any valid grasp candidates from HTML.")
+    return out
+
+
+def parse_top_grasp_from_html(
+    html_path: str | Path,
+    unit_scale: float = 1e-3,
+    mesh_root: str | Path | None = None,
+) -> TopGraspData:
+    """
+    Parse a feasible-grasp Plotly HTML and extract the highest-ranked marker grasp.
+
+    `unit_scale=1e-3` converts mm (grasp output) -> m (MuJoCo).
+    """
+    return parse_ranked_grasp_candidates_from_html(
+        html_path=html_path,
+        unit_scale=unit_scale,
+        max_candidates=1,
+        mesh_root=mesh_root,
+    )[0]

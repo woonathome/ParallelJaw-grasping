@@ -1,4 +1,8 @@
-from .html_grasp_parser import TopGraspData, parse_top_grasp_from_html
+from .html_grasp_parser import (
+    TopGraspData,
+    parse_ranked_grasp_candidates_from_html,
+    parse_top_grasp_from_html,
+)
 from .mujoco_parallel_jaw_sim import (
     SimConfig,
     launch_notebook_ui,
@@ -15,6 +19,7 @@ __all__ = [
     "TopGraspData",
     "SimConfig",
     "parse_top_grasp_from_html",
+    "parse_ranked_grasp_candidates_from_html",
     "simulate_from_parsed_grasp",
     "simulate_from_html",
     "play_in_viewer_from_parsed_grasp",
