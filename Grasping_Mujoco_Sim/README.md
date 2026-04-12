@@ -1,53 +1,65 @@
 # Grasping_Mujoco_Sim
 
-`Grasping_Results_SurfaceContact`의 `1-grasping_pairs_feasible_*.html` 결과를 읽어,
-MuJoCo 기반 parallel-jaw grasp 동적 테스트를 수행하는 모듈입니다.
+MuJoCo-based parallel-jaw grasp simulation from feasible grasp HTML files
+(`Grasping_Results_SurfaceContact/.../1-grasping_pairs_feasible_*.html`).
 
-## 구현된 시뮬레이션 사양
+## What This Module Does
 
-1. HTML에서 최상위 grasp pair(첫 `pair ...` trace)를 파싱해 object grasp 시뮬레이션 수행
-2. grasp 후 jaw 기준 3방향 이동 테스트 수행
-   - `depth`: jaw 조임 방향(pad depth 축)
-   - `width`: pad width 축
-   - `height`: pad height 축
-3. 각 방향에서 빠른 이동(속도 기반) 중 object escape 여부 판정
-4. 노트북 UI 제공
-   - `depth/width/height` 속도
-   - 마찰계수 `mu`
-   - grasp force(N)
-5. MuJoCo native viewer 창 실행 지원
-   - 그리퍼 패드 + 물체 상호작용만 렌더링
-   - 로봇 암/로봇 베이스 모델은 포함하지 않음
+- Parses grasp pair pose and pad direction from Plotly HTML traces.
+- Builds a lightweight MuJoCo scene (pads + object only, no robot arm model).
+- Runs grasp close + 3-axis disturbance test (`depth`, `width`, `height`).
+- Reports dynamic stability / escape status as a Python dict.
+- Supports interactive viewer and offscreen video recording.
 
-## 파일 구성
+## Object Mesh Policy (Current)
+
+Object mesh is selected in this order:
+
+1. Decode object `mesh3d` from HTML.
+2. Check whether that HTML mesh is watertight.
+3. If watertight: use HTML mesh directly.
+4. If not watertight: load original mesh from `models_target/models_cad/...`
+   and align it to the HTML frame (uniform scale + centroid shift).
+
+Notes:
+- Grasp pair / pad pose always comes from HTML traces.
+- `trimesh` is required for watertight check and original mesh loading.
+
+## Main Files
 
 - `html_grasp_parser.py`
-  - Plotly HTML에서 object mesh + top grasp pair + local grasp 축 추출
+  - Parses Plotly HTML traces.
+  - Resolves object mesh (HTML watertight-first, external fallback).
 - `mujoco_parallel_jaw_sim.py`
-  - MuJoCo 모델 생성, grasp/perturb 시뮬레이션, escape 판정, notebook UI
+  - MuJoCo model construction, grasp simulation, perturbation, escape checks.
+  - Viewer/offscreen recording and notebook UI.
 - `__init__.py`
-  - 외부 공개 API
+  - Public API exports.
 
-## 환경
+## Environment
 
-현재 프로젝트 기준 `sam6d`는 Python `3.9.19`입니다.
+Recommended environment:
+
+- Python: `3.9.x` (`sam6d`)
+- Required runtime packages:
+  - `mujoco`
+  - `numpy`
+  - `trimesh`
+  - `opencv-python` (for MP4 recording)
+  - `ipywidgets` (for notebook UI)
+
+Install minimal dependencies in `sam6d`:
 
 ```bash
-conda run -n sam6d python --version
+conda run -n sam6d pip install mujoco trimesh opencv-python ipywidgets
 ```
 
-MuJoCo가 없다면 설치:
-
-```bash
-conda run -n sam6d pip install mujoco
-```
-
-## 빠른 사용
+## Quick Start
 
 ```python
 from Grasping_Mujoco_Sim import run_from_html
 
-html_path = "Grasping_Results_SurfaceContact/custom_hh/1-grasping_pairs_feasible_boardmarker_922sol.html"
+html_path = "Grasping_Results_SurfaceContact/BOP_ITODD/1-grasping_pairs_feasible_obj_000005_60sol.html"
 
 result = run_from_html(
     html_path=html_path,
@@ -57,35 +69,68 @@ result = run_from_html(
     friction=0.8,
     grasp_force=100.0,
 )
+
+print(result["pair_name"])
 print(result["stable_after_grasp"], result["any_escape"])
-print(result["perturbation"])
 ```
 
-뷰어까지 포함해서 실행:
+## Viewer Run
 
 ```python
 result = run_from_html(
     html_path=html_path,
-    friction=0.8,
-    grasp_force=100.0,
-    depth_speed=0.8,
-    width_speed=0.6,
-    height_speed=0.6,
-    open_viewer=True,       # MuJoCo UI 창 띄움
-    realtime_viewer=True,   # 실시간 속도로 재생
+    open_viewer=True,
+    realtime_viewer=True,
+    show_contact_points=True,
+    show_contact_forces=False,
 )
 ```
+
+## Offscreen Video Recording
+
+```python
+result = run_from_html(
+    html_path=html_path,
+    record_video_path="Grasping_Mujoco_Result/sample.mp4",
+    record_video_fps=30,
+    record_video_width=960,
+    record_video_height=540,
+    record_split_dual_view=True,   # left/right split views
+    show_contact_points=True,
+    show_contact_forces=False,
+)
+```
+
+## Candidate Pair Selection
+
+Default behavior:
+
+- Start from first ranked HTML pair (`max_candidates=1` initial pass).
+- No fallback scan unless explicitly enabled.
+
+Optional controls in `run_from_html(...)`:
+
+- `enable_pair_fallback`
+- `pair_fallback_max_candidates`
+- `auto_pair_rescue_on_no_contact`
+- `auto_pair_rescue_max_candidates`
+- `auto_pair_rescue_require_thin_support`
 
 ## Notebook UI
 
 ```python
 from Grasping_Mujoco_Sim import launch_notebook_ui
-launch_notebook_ui("Grasping_Results_SurfaceContact/custom_hh/1-grasping_pairs_feasible_boardmarker_922sol.html")
+
+launch_notebook_ui(
+    "Grasping_Results_SurfaceContact/BOP_ITODD/1-grasping_pairs_feasible_obj_000005_60sol.html"
+)
 ```
 
-## Escape 판정 기준
+UI sliders:
 
-- 일정 step 이상 finger-object 접촉 상실 (`min_loss_contact_steps`)
-- 또는 gripper 기준 object 상대 변위가 임계치 초과 (`escape_distance`)
+- disturbance speeds (`depth/width/height`)
+- friction (`mu`)
+- grasp force
+- perturbation / hold timing
+- viewer options
 
-두 조건 중 하나라도 만족하면 해당 방향 escape로 판정합니다.
