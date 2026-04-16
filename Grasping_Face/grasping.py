@@ -41,8 +41,8 @@ class PatchPairCandidate:
 
 @dataclass
 class PadParams: # Robotiq AG145 기준
-    pad_w: float = 34.0 # 34
-    pad_h: float = 21.0 # 21
+    pad_w: float = 10.0 # 34
+    pad_h: float = 10.0 # 21
     pad_d: float = 7.0 # 7
     mu: float = 0.8
 
