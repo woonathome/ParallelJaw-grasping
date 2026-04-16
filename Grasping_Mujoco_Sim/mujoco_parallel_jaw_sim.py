@@ -85,9 +85,9 @@ class SimConfig:
     auto_pair_rescue_require_thin_support: bool = True
 
     # 3-direction perturb speeds (m/s)
-    depth_speed: float = 0.6
-    width_speed: float = 0.6
-    height_speed: float = 0.6
+    depth_speed: float = 1.0
+    width_speed: float = 1.0
+    height_speed: float = 1.0
     max_move: float = 0.03
 
     # Timing
@@ -99,7 +99,7 @@ class SimConfig:
 
     # Escape criteria
     escape_distance: float = 0.02
-    min_loss_contact_steps: int = 12
+    min_loss_contact_steps: int = 100
 
     # Parse scale: HTML(mm) -> MuJoCo(m)
     unit_scale: float = 1e-3
