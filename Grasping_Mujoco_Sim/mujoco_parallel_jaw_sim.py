@@ -78,7 +78,7 @@ class SimConfig:
     opening_retry_step: float = 0.004
     max_initial_opening_extra: float = 0.05
     max_opening_retries: int = 8
-    enable_pair_fallback: bool = False
+    enable_pair_fallback: bool = True
     pair_fallback_max_candidates: int = 64
     auto_pair_rescue_on_no_contact: bool = False
     auto_pair_rescue_max_candidates: int = 64
